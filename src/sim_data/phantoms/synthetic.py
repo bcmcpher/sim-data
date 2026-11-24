@@ -14,18 +14,7 @@ import nibabel as nib
 import numpy as np
 from scipy import ndimage
 
-
-def _fibonacci_sphere(n_dirs: int) -> np.ndarray:
-    """Generate evenly distributed unit gradient vectors on the hemisphere (3, n_dirs)."""
-    indices = np.arange(n_dirs, dtype=np.float64) + 0.5
-    phi = np.arccos(1.0 - indices / max(n_dirs, 1))
-    theta = np.pi * (1.0 + 5.0**0.5) * indices
-    x = np.sin(phi) * np.cos(theta)
-    y = np.sin(phi) * np.sin(theta)
-    z = np.cos(phi)
-    vecs = np.vstack([x, y, z])
-    norms = np.linalg.norm(vecs, axis=0, keepdims=True) + 1e-8
-    return np.asarray(vecs / norms, dtype=np.float32)
+from sim_data.io.bids import sample_electrostatic_directions
 
 
 def _build_anatomical_compartments(
@@ -135,7 +124,7 @@ def _synthesize_dwi(
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Synthesize clean 4D DWI volume with Stejskal-Tanner directional WM signal attenuation."""
     b0_base = 640.0 * comp["wm"] + 780.0 * comp["gm"] + 1050.0 * comp["csf"] + 200.0 * comp["scalp"]
-    dirs = _fibonacci_sphere(n_dirs)
+    dirs = sample_electrostatic_directions(n_dirs, rng, iters=150)
     bvals = np.concatenate([np.zeros(n_b0, dtype=np.float32), np.full(n_dirs, 1000.0, dtype=np.float32)])
     bvecs = np.hstack([np.zeros((3, n_b0), dtype=np.float32), dirs])
 

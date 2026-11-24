@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import nibabel as nib
+import nibabel.processing as nib_proc
 import numpy as np
 from scipy import ndimage
 from sklearn.mixture import GaussianMixture
@@ -46,7 +47,7 @@ def resample_nifti_to_grid(
     target_affine: np.ndarray,
     order: int = 1,
 ) -> np.ndarray:
-    """Load a 3D or 4D NIfTI template and resample it onto (target_shape, target_affine) in RAS+."""
+    """Load a 3D or 4D NIfTI template and resample onto (target_shape, target_affine) via nibabel."""
     img = nib.load(str(nifti_path))
     if not isinstance(img, nib.Nifti1Image):
         if isinstance(img, nib.spatialimages.SpatialImage):
@@ -55,28 +56,17 @@ def resample_nifti_to_grid(
             raise TypeError(f"Unsupported template image type: {type(img).__name__}")
     src_data, src_affine, _ = canonicalize_to_ras(img)
 
-    # Map target voxel index -> world -> source voxel index
-    rel = np.linalg.inv(src_affine) @ target_affine
-    mat = rel[:3, :3]
-    offset = rel[:3, 3]
-
     if src_data.ndim == 3:
-        out = ndimage.affine_transform(
-            src_data, matrix=mat, offset=offset, output_shape=target_shape, order=order, mode="nearest"
-        )
-        return np.asarray(out, dtype=np.float32)
+        src_3d = nib.Nifti1Image(src_data, src_affine)
+        res = nib_proc.resample_from_to(src_3d, (target_shape, target_affine), order=order)
+        return np.asarray(res.get_fdata(dtype=np.float32), dtype=np.float32)
 
     n_ch = src_data.shape[3]
     out_4d = np.empty((*target_shape, n_ch), dtype=np.float32)
     for c in range(n_ch):
-        out_4d[..., c] = ndimage.affine_transform(
-            src_data[..., c],
-            matrix=mat,
-            offset=offset,
-            output_shape=target_shape,
-            order=order,
-            mode="nearest",
-        )
+        src_c = nib.Nifti1Image(src_data[..., c], src_affine)
+        res_c = nib_proc.resample_from_to(src_c, (target_shape, target_affine), order=order)
+        out_4d[..., c] = np.asarray(res_c.get_fdata(dtype=np.float32), dtype=np.float32)
     return out_4d
 
 

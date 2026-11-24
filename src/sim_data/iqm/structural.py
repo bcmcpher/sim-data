@@ -7,6 +7,7 @@ to clean baselines or simulation metadata.
 from __future__ import annotations
 
 import numpy as np
+import SimpleITK as sitk
 from scipy import ndimage, stats
 
 from sim_data.io.orientation import compute_anatomical_priors
@@ -98,20 +99,51 @@ def compute_qi1_qi2(bg_vals: np.ndarray) -> tuple[float, float]:
     return (qi1, qi2)
 
 
-def compute_inu_proxy(vol: np.ndarray, brain_mask: np.ndarray) -> tuple[float, float]:
-    """Smooth low-frequency bias field proxy approximating N4ITK INU (inu_med, inu_range)."""
+def compute_inu_n4(vol: np.ndarray, brain_mask: np.ndarray) -> tuple[float, float]:
+    """MRIQC-aligned N4ITK bias field estimate (inu_med, inu_range) via SimpleITK."""
     fg = vol[brain_mask]
     med = float(np.median(fg))
     if med <= _EPS or int(brain_mask.sum()) < 64:
         return (1.0, 0.0)
+
+    try:
+        # SimpleITK expects strictly positive float32 values for log-space N4ITK estimation
+        v_pos = np.maximum(vol.astype(np.float32), 1e-3)
+        sitk_img = sitk.GetImageFromArray(v_pos)
+        sitk_mask = sitk.GetImageFromArray(brain_mask.astype(np.uint8))
+
+        shrink_factor = max(1, min(3, min(vol.shape) // 16))
+        if shrink_factor > 1:
+            img_small = sitk.Shrink(sitk_img, [shrink_factor] * 3)
+            mask_small = sitk.Shrink(sitk_mask, [shrink_factor] * 3)
+        else:
+            img_small = sitk_img
+            mask_small = sitk_mask
+
+        n4 = sitk.N4BiasFieldCorrectionImageFilter()
+        n4.SetMaximumNumberOfIterations([30, 20])
+        n4.SetConvergenceThreshold(1e-6)
+        n4.Execute(img_small, mask_small)
+
+        log_bias = n4.GetLogBiasFieldAsImage(sitk_img)
+        bias_arr = np.exp(sitk.GetArrayFromImage(log_bias).astype(np.float64))
+        vals = bias_arr[brain_mask]
+        b_med = max(float(np.median(vals)), _EPS)
+        rel = vals / b_med
+        inu_med = float(np.median(vals))
+        inu_range = float(np.percentile(rel, 95.0) - np.percentile(rel, 5.0))
+        if np.isfinite(inu_med) and np.isfinite(inu_range):
+            return (inu_med, inu_range)
+    except Exception:
+        pass
+
+    # Fallback smooth convolution proxy on degenerate arrays
     sigma = tuple(max(3.0, s / 8.0) for s in vol.shape)
     num = ndimage.gaussian_filter(vol * brain_mask.astype(np.float32), sigma=sigma, mode="constant")
     den = ndimage.gaussian_filter(brain_mask.astype(np.float32), sigma=sigma, mode="constant")
     smooth = np.where(den > 0.15, num / np.maximum(den, _EPS), med)
-    rel = smooth[brain_mask] / med
-    inu_med = float(np.median(rel))
-    inu_range = float(np.percentile(rel, 95.0) - np.percentile(rel, 5.0))
-    return (inu_med, inu_range)
+    rel_fb = smooth[brain_mask] / med
+    return (float(np.median(rel_fb)), float(np.percentile(rel_fb, 95.0) - np.percentile(rel_fb, 5.0)))
 
 
 def compute_gsr(vol: np.ndarray, brain_mask: np.ndarray, axis: int) -> float:
@@ -178,7 +210,7 @@ def extract_structural_iqms(
     fber = float(min(fg_energy / (bg_energy + 1e-4), 1e5))
 
     qi1, qi2 = compute_qi1_qi2(bg_vals)
-    inu_med, inu_range = compute_inu_proxy(v, brain)
+    inu_med, inu_range = compute_inu_n4(v, brain)
     fwhm_x, fwhm_y, fwhm_z, fwhm_avg = compute_fwhm(v, brain, zooms)
 
     # Blind supplemental metrics computed purely from the modified image:

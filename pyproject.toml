@@ -13,6 +13,7 @@ dependencies = [
     "numpy>=1.26.0",
     "scipy>=1.11.0",
     "nibabel>=5.2.0",
+    "dipy>=1.9.0",
     "torchio>=0.20.0",
     "monai>=1.4.0",
     "pydantic>=2.6.0",
@@ -35,8 +36,7 @@ cu128 = [
     "torch>=2.7.0",
 ]
 harmonization = [
-    "combatlearn>=0.1.0",
-    "neuroCombat>=0.2.12",
+    "combatlearn>=2.0.0",
 ]
 
 [dependency-groups]
@@ -103,6 +103,8 @@ no_implicit_optional = true
 [[tool.mypy.overrides]]
 module = [
     "nibabel.*",
+    "dipy.*",
+    "SimpleITK.*",
     "scipy.*",
     "skimage.*",
     "sklearn.*",

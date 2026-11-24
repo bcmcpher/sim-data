@@ -7,6 +7,8 @@ with zero access to simulation metadata.
 from __future__ import annotations
 
 import numpy as np
+from dipy.core.gradients import gradient_table
+from dipy.denoise.noise_estimate import estimate_sigma, piesno
 
 from sim_data.io.orientation import compute_anatomical_priors
 from sim_data.iqm.functional import estimate_fd_proxy
@@ -44,9 +46,16 @@ def compute_neighbor_dwi_corr(
         g_norm = g / (np.linalg.norm(g, axis=0, keepdims=True) + _EPS)
         ang_sim = np.abs(g_norm.T @ g_norm)
         np.fill_diagonal(ang_sim, -1.0)
-        neighbors = np.argmax(ang_sim, axis=1)
+        # Match multi-shell QSIPrep NDC: restrict nearest neighbor search to the same b-shell
+        dw_bvals = bvals[dw_idx] if (bvals is not None and len(bvals) == n_vols) else None
         for i in range(m):
-            j = int(neighbors[i])
+            sims = ang_sim[i].copy()
+            if dw_bvals is not None:
+                same_shell = np.abs(dw_bvals - dw_bvals[i]) < 150.0
+                same_shell[i] = False
+                if np.any(same_shell):
+                    sims[~same_shell] = -2.0
+            j = int(np.argmax(sims))
             corrs.append(float(np.dot(unit[:, i], unit[:, j])))
     else:
         for i in range(m - 1):
@@ -122,8 +131,12 @@ def extract_diffusion_iqms(
     n_vols = arr.shape[3]
 
     if bvals is not None and len(bvals) == n_vols:
-        b0_idx = np.where(bvals <= 50.0)[0]
-        high_b_idx = np.where(bvals > 150.0)[0]
+        bvecs_for_gtab = (
+            bvecs.T if (bvecs is not None and bvecs.shape == (3, n_vols)) else None
+        )
+        gtab = gradient_table(bvals, bvecs=bvecs_for_gtab, b0_threshold=50.0)
+        b0_idx = np.where(gtab.b0s_mask)[0]
+        high_b_idx = np.where(~gtab.b0s_mask)[0]
         raw_max_b = float(np.max(bvals))
     else:
         b0_idx = np.array([0], dtype=int)
@@ -135,9 +148,29 @@ def extract_diffusion_iqms(
     brain = priors.brain_mask
     bg = priors.bg_mask
 
+    # Genuine Koay et al. (2009) PIESNO noise estimation via DIPY (with estimate_sigma & Rayleigh fallback)
+    piesno_sigma = 0.0
+    try:
+        p_sig = np.asarray(piesno(arr, N=1, return_mask=False), dtype=np.float64)
+        pos_sig = p_sig[np.isfinite(p_sig) & (p_sig > 1e-4)]
+        if pos_sig.size > 0:
+            piesno_sigma = float(np.median(pos_sig))
+    except Exception:
+        piesno_sigma = 0.0
+
+    if piesno_sigma <= 1e-4:
+        try:
+            est = np.asarray(estimate_sigma(arr, N=1), dtype=np.float64)
+            pos_est = est[np.isfinite(est) & (est > 1e-4)]
+            if pos_est.size > 0:
+                piesno_sigma = float(np.median(pos_est))
+        except Exception:
+            piesno_sigma = 0.0
+
     bg_vals_b0 = b0_vol[bg] if int(bg.sum()) > 0 else np.array([0.0], dtype=np.float32)
-    piesno_sigma = float(max(np.std(bg_vals_b0) * 1.5264, np.mean(bg_vals_b0) * 0.7979, _EPS))
-    raw_b0_snr = float(np.mean(b0_vol[brain]) / piesno_sigma)
+    if piesno_sigma <= 1e-4:
+        piesno_sigma = float(max(np.std(bg_vals_b0) * 1.5264, np.mean(bg_vals_b0) * 0.7979, _EPS))
+    raw_b0_snr = float(np.mean(b0_vol[brain]) / max(piesno_sigma, _EPS))
 
     efc_b0 = compute_efc(b0_vol)
     gsr_x_b0 = compute_gsr(b0_vol, brain, axis=0)

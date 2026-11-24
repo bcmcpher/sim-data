@@ -7,6 +7,7 @@ from typing import Any
 
 import nibabel as nib
 import numpy as np
+from dipy.segment.mask import median_otsu
 from scipy import ndimage
 from skimage.filters import threshold_otsu
 
@@ -112,11 +113,16 @@ def compute_anatomical_priors(
     p99 = float(np.percentile(pos, 99.5))
     clipped = np.clip(ref, 0.0, p99)
     try:
-        thresh = float(threshold_otsu(clipped[clipped > 0])) * 0.45
+        # Light DIPY median_otsu denoising combined with conservative low-signal threshold
+        # preserves cortical GM and darker CSF instead of shrinking to inner WM core
+        _masked, otsu_mask = median_otsu(clipped, median_radius=1, numpass=1, dilate=1)
+        thresh_low = float(threshold_otsu(clipped[clipped > 0])) * 0.45
+        raw_fg = np.asarray(otsu_mask, dtype=bool) | (
+            ref > max(thresh_low, float(np.percentile(pos, 10.0)))
+        )
     except Exception:
-        thresh = float(np.percentile(pos, 25.0))
+        raw_fg = ref > float(np.percentile(pos, 25.0))
 
-    raw_fg = ref > max(thresh, float(np.percentile(pos, 10.0)))
     raw_fg = ndimage.binary_closing(raw_fg, iterations=2)
     raw_fg = ndimage.binary_fill_holes(raw_fg)
     brain_mask = _largest_component(raw_fg)

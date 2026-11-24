@@ -4,8 +4,11 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import nibabel as nib
+import nibabel.processing as nib_proc
 import numpy as np
 import torch
+from dipy.reconst.dti import decompose_tensor, from_lower_triangular
 from scipy import ndimage
 
 from sim_data.artifacts.base import resolve_device
@@ -16,21 +19,9 @@ from sim_data.config import (
     Modality,
     StructuralSynthesisConfig,
 )
+from sim_data.io.bids import sample_electrostatic_directions
 from sim_data.synthesis.tissue import TissueMRIParams, TissuePVEMaps, resample_nifti_to_grid
 from sim_data.synthesis.warp import DiffeomorphicField, warp_vector_field_ppd, warp_volume
-
-
-def _fibonacci_hemisphere(n_dirs: int, rng: np.random.Generator) -> np.ndarray:
-    """Generate evenly distributed unit gradient vectors on the unit hemisphere (3, n_dirs)."""
-    indices = np.arange(n_dirs, dtype=np.float64) + 0.5
-    phi = np.arccos(1.0 - indices / max(n_dirs, 1))
-    theta = np.pi * (1.0 + 5.0**0.5) * indices + float(rng.uniform(0.0, 2.0 * np.pi))
-    x = np.sin(phi) * np.cos(theta)
-    y = np.sin(phi) * np.sin(theta)
-    z = np.cos(phi)
-    vecs = np.vstack([x, y, z])
-    norms = np.linalg.norm(vecs, axis=0, keepdims=True) + 1e-8
-    return np.asarray(vecs / norms, dtype=np.float32)
 
 
 def _resample_pve_to_spacing(
@@ -39,20 +30,43 @@ def _resample_pve_to_spacing(
     src_zooms: tuple[float, float, float],
     target_zooms: tuple[float, float, float],
 ) -> tuple[TissuePVEMaps, np.ndarray]:
-    """Resample 3D tissue PVE maps to a coarser/finer voxel grid and update the NIfTI affine."""
-    src_shape = np.array(pve.wm.shape, dtype=np.float64)
-    scale_factors = np.array(src_zooms, dtype=np.float64) / np.maximum(
-        np.array(target_zooms, dtype=np.float64), 0.2
+    """Resample 3D tissue PVE maps to target voxel spacing via nibabel.processing.resample_to_output."""
+    _ = src_zooms
+    res_csf = nib_proc.resample_to_output(
+        nib.Nifti1Image(pve.csf, src_affine), voxel_sizes=target_zooms, order=1
     )
-    new_shape = tuple(max(12, int(round(s * f))) for s, f in zip(src_shape, scale_factors, strict=True))
-    actual_zoom = tuple(
-        float(new_shape[i]) / float(pve.wm.shape[i]) for i in range(3)
+    target_spec = (res_csf.shape[:3], res_csf.affine)
+    csf = np.clip(np.asarray(res_csf.get_fdata(dtype=np.float32), dtype=np.float32), 0.0, 1.0)
+    gm = np.clip(
+        np.asarray(
+            nib_proc.resample_from_to(
+                nib.Nifti1Image(pve.gm, src_affine), target_spec, order=1
+            ).get_fdata(dtype=np.float32),
+            dtype=np.float32,
+        ),
+        0.0,
+        1.0,
     )
-
-    csf = np.clip(ndimage.zoom(pve.csf, actual_zoom, order=1), 0.0, 1.0).astype(np.float32)
-    gm = np.clip(ndimage.zoom(pve.gm, actual_zoom, order=1), 0.0, 1.0).astype(np.float32)
-    wm = np.clip(ndimage.zoom(pve.wm, actual_zoom, order=1), 0.0, 1.0).astype(np.float32)
-    scalp = np.clip(ndimage.zoom(pve.scalp, actual_zoom, order=1), 0.0, 1.0).astype(np.float32)
+    wm = np.clip(
+        np.asarray(
+            nib_proc.resample_from_to(
+                nib.Nifti1Image(pve.wm, src_affine), target_spec, order=1
+            ).get_fdata(dtype=np.float32),
+            dtype=np.float32,
+        ),
+        0.0,
+        1.0,
+    )
+    scalp = np.clip(
+        np.asarray(
+            nib_proc.resample_from_to(
+                nib.Nifti1Image(pve.scalp, src_affine), target_spec, order=1
+            ).get_fdata(dtype=np.float32),
+            dtype=np.float32,
+        ),
+        0.0,
+        1.0,
+    )
 
     total = csf + gm + wm + scalp
     head_mask = total > 0.15
@@ -63,11 +77,6 @@ def _resample_pve_to_spacing(
     scalp = np.where(head_mask, scalp / denom, 0.0).astype(np.float32)
     brain_mask = (csf + gm + wm) > 0.35
 
-    new_affine = src_affine.copy()
-    for i in range(3):
-        ratio = float(pve.wm.shape[i]) / float(new_shape[i])
-        new_affine[:3, i] = src_affine[:3, i] * ratio
-
     return (
         TissuePVEMaps(
             csf=csf,
@@ -77,7 +86,7 @@ def _resample_pve_to_spacing(
             brain_mask=np.asarray(brain_mask, dtype=bool),
             head_mask=np.asarray(head_mask, dtype=bool),
         ),
-        new_affine,
+        np.asarray(res_csf.affine, dtype=np.float64),
     )
 
 
@@ -363,19 +372,11 @@ def _extract_primary_eigenvector_from_template(
         norms = np.linalg.norm(raw, axis=-1, keepdims=True) + 1e-6
         return np.asarray(raw / norms, dtype=np.float32)
 
-    # Symmetric 6-component tensor [Dxx, Dxy, Dxz, Dyy, Dyz, Dzz] -> principal eigenvector
-    n_vox = int(np.prod(src_shape))
-    flat = raw.reshape(n_vox, 6)
-    mats = np.zeros((n_vox, 3, 3), dtype=np.float32)
-    mats[:, 0, 0] = flat[:, 0]
-    mats[:, 0, 1] = mats[:, 1, 0] = flat[:, 1]
-    mats[:, 0, 2] = mats[:, 2, 0] = flat[:, 2]
-    mats[:, 1, 1] = flat[:, 3]
-    mats[:, 1, 2] = mats[:, 2, 1] = flat[:, 4]
-    mats[:, 2, 2] = flat[:, 5]
-    _evals, evecs = np.linalg.eigh(mats)
-    # eigh sorts ascending; index 2 is principal eigenvector
-    v1 = evecs[:, :, 2].reshape(*src_shape, 3).astype(np.float32)
+    # Lower-triangular 6-component tensor -> principal eigenvector via DIPY
+    tensors = from_lower_triangular(raw)
+    _evals, evecs = decompose_tensor(tensors)
+    # DIPY decompose_tensor sorts eigenvalues descending; index 0 is principal eigenvector
+    v1 = np.asarray(evecs[..., :, 0], dtype=np.float32)
     norms = np.linalg.norm(v1, axis=-1, keepdims=True) + 1e-6
     return np.asarray(v1 / norms, dtype=np.float32)
 
@@ -432,12 +433,12 @@ def synthesize_dwi_4d(
     else:
         w_cross = np.zeros(dwi_shape, dtype=np.float32)
 
-    # Build multi-shell gradient table (bvals, bvecs)
+    # Build multi-shell gradient table (bvals, bvecs) via DIPY electrostatic repulsion
     bval_parts: list[np.ndarray] = [np.zeros(cfg.n_b0, dtype=np.float32)]
     bvec_parts: list[np.ndarray] = [np.zeros((3, cfg.n_b0), dtype=np.float32)]
     for b_val, n_dirs in cfg.shells:
         bval_parts.append(np.full(int(n_dirs), float(b_val), dtype=np.float32))
-        bvec_parts.append(_fibonacci_hemisphere(int(n_dirs), rng))
+        bvec_parts.append(sample_electrostatic_directions(int(n_dirs), rng))
     bvals = np.concatenate(bval_parts, axis=0)
     bvecs = np.hstack(bvec_parts).astype(np.float32)  # (3, N_vols)
 

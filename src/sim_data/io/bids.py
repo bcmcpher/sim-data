@@ -11,6 +11,8 @@ from typing import Any
 import nibabel as nib
 import numpy as np
 import pandas as pd
+from dipy.core.sphere import HemiSphere, disperse_charges
+from dipy.io.gradients import read_bvals_bvecs
 
 from sim_data.config import Modality, SiteNaming
 
@@ -143,16 +145,36 @@ def load_bids_scan(scan: BIDSScan) -> LoadedBIDSScan:
 
     bvals: np.ndarray | None = None
     bvecs: np.ndarray | None = None
-    if scan.bval_path and scan.bval_path.exists():
-        bvals = np.loadtxt(scan.bval_path, dtype=np.float32).reshape(-1)
-    if scan.bvec_path and scan.bvec_path.exists():
-        raw_bvecs = np.loadtxt(scan.bvec_path, dtype=np.float32)
-        if raw_bvecs.ndim == 2:
-            if raw_bvecs.shape[0] != 3 and raw_bvecs.shape[1] == 3:
-                raw_bvecs = raw_bvecs.T
-            bvecs = raw_bvecs
+    bval_str = str(scan.bval_path) if (scan.bval_path and scan.bval_path.exists()) else None
+    bvec_str = str(scan.bvec_path) if (scan.bvec_path and scan.bvec_path.exists()) else None
+    if bval_str is not None or bvec_str is not None:
+        raw_bvals, raw_bvecs = read_bvals_bvecs(bval_str, bvec_str)
+        if raw_bvals is not None:
+            bvals = np.asarray(raw_bvals, dtype=np.float32).reshape(-1)
+        if raw_bvecs is not None:
+            bv = np.asarray(raw_bvecs, dtype=np.float32)
+            # DIPY read_bvals_bvecs returns (N, 3); store as BIDS-standard (3, N)
+            if bv.ndim == 2 and bv.shape[1] == 3 and bv.shape[0] != 3:
+                bv = bv.T
+            elif bv.ndim == 2 and bv.shape[1] == 3 and bvals is not None and len(bvals) == bv.shape[0]:
+                bv = bv.T
+            bvecs = np.ascontiguousarray(bv, dtype=np.float32)
 
     return LoadedBIDSScan(scan=scan, img=img, sidecar=sidecar, bvals=bvals, bvecs=bvecs)
+
+
+def sample_electrostatic_directions(
+    n_dirs: int,
+    rng: np.random.Generator,
+    iters: int = 300,
+) -> np.ndarray:
+    """Generate uniformly dispersed unit gradient directions (3, n_dirs) via DIPY electrostatic repulsion."""
+    pts = rng.normal(0.0, 1.0, size=(max(1, n_dirs), 3)).astype(np.float64)
+    norms = np.linalg.norm(pts, axis=1, keepdims=True) + 1e-8
+    pts = pts / norms
+    hemi = HemiSphere(xyz=pts)
+    dispersed, _potential = disperse_charges(hemi, iters=iters)
+    return np.ascontiguousarray(dispersed.vertices.T, dtype=np.float32)
 
 
 def _sanitize_entity(value: str) -> str:
