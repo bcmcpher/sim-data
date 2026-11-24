@@ -7,6 +7,7 @@ name = "sim-data"
 version = "0.1.0"
 description = "Physics-ordered multimodal MRI artifact and multi-site effect simulator for visual & automated QC"
 readme = "README.md"
+license = { file = "LICENSE" }
 requires-python = ">=3.10"
 dependencies = [
     "numpy>=1.26.0",
