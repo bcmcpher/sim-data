@@ -8,6 +8,7 @@ dist/
 build/
 .pytest_cache/
 .ruff_cache/
+.mypy_cache/
 .coverage
 htmlcov/
 
@@ -16,7 +17,8 @@ demo_bids/
 demo_out/
 *.nii
 *.nii.gz
-!tests/**
+!tests/**/*.nii
+!tests/**/*.nii.gz
 
 # OS / editor artifacts
 .DS_Store
