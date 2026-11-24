@@ -1,0 +1,94 @@
+global_seed: 2026
+modalities: ["T1w", "T2w", "FLAIR", "bold", "dwi"]
+sampling:
+  mode: multisite_factorial
+  include_clean_baseline: true
+  samples_per_scan_per_site: 3
+  min_artifacts: 1
+  max_artifacts: 3
+  severity_range: [0.20, 0.90]
+  rotate_dwi_bvecs: false
+  artifacts:
+    - name: motion_3d
+      weight: 1.4
+    - name: motion_4d
+      weight: 1.5
+    - name: ghosting_3d
+      weight: 1.1
+    - name: nyquist_n2_ghost
+      weight: 1.3
+    - name: wrap_around
+      weight: 1.1
+    - name: bias_field
+      weight: 1.2
+    - name: rf_spike
+      weight: 0.9
+    - name: susceptibility_metal
+      weight: 1.0
+    - name: epi_susceptibility
+      weight: 1.2
+    - name: eddy_currents_dwi
+      weight: 1.1
+    - name: dwi_slice_dropout
+      weight: 1.4
+    - name: rician_noise
+      weight: 1.3
+    - name: temporal_drift
+      weight: 1.0
+    - name: fov_cropping
+      weight: 0.9
+    - name: gibbs_ringing
+      weight: 1.0
+    - name: anisotropy
+      weight: 1.0
+    - name: defacing_damage
+      weight: 1.0
+sites:
+  - site_id: Siemens_3T_32ch
+    contrast_gamma: 0.94
+    intensity_gain: 1.08
+    intensity_offset: 0.0
+    psf_sigma_vox: [0.25, 0.25, 0.30]
+    bias_order: 2
+    bias_coeffs: [0.10, -0.06, 0.08]
+    coil_count: 32
+    noise_sigma_rel: 0.012
+    g_factor_strength: 0.12
+    voxel_scale: [1.0, 1.0, 1.0]
+    jitter_scale: 0.08
+  - site_id: GE_15T_8ch
+    contrast_gamma: 1.18
+    intensity_gain: 0.88
+    intensity_offset: 0.015
+    psf_sigma_vox: [0.70, 0.70, 0.95]
+    bias_order: 3
+    bias_coeffs: [-0.16, 0.14, -0.10]
+    coil_count: 8
+    noise_sigma_rel: 0.032
+    g_factor_strength: 0.22
+    voxel_scale: [0.99, 0.99, 1.01]
+    jitter_scale: 0.10
+  - site_id: Philips_3T_16ch
+    contrast_gamma: 1.04
+    intensity_gain: 1.24
+    intensity_offset: -0.005
+    psf_sigma_vox: [0.40, 0.45, 0.75]
+    bias_order: 2
+    bias_coeffs: [0.14, 0.12, -0.12]
+    coil_count: 16
+    noise_sigma_rel: 0.020
+    g_factor_strength: 0.28
+    voxel_scale: [1.01, 1.00, 0.99]
+    jitter_scale: 0.08
+output:
+  save_nifti: true
+  extract_iqms: true
+  render_views: true
+  render_midline: true
+  render_enhanced: true
+  image_format: png
+  write_packets: true
+  manifest_formats: ["parquet", "tsv"]
+  qc_thresholds:
+    pass_max_severity: 0.22
+    borderline_max_severity: 0.56

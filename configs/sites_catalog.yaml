@@ -1,0 +1,56 @@
+sites:
+  - site_id: Siemens_3T_32ch
+    description: "3T Siemens Prisma-like 32-channel coil: crisp resolution, high contrast, low noise floor"
+    contrast_gamma: 0.94
+    intensity_gain: 1.08
+    intensity_offset: 0.0
+    psf_sigma_vox: [0.25, 0.25, 0.30]
+    bias_order: 2
+    bias_coeffs: [0.10, -0.06, 0.08]
+    coil_count: 32
+    noise_sigma_rel: 0.012
+    g_factor_strength: 0.12
+    voxel_scale: [1.0, 1.0, 1.0]
+    jitter_scale: 0.08
+
+  - site_id: GE_15T_8ch
+    description: "1.5T GE-like 8-channel coil: softer PSF, compressed contrast, stronger Rician noise floor"
+    contrast_gamma: 1.18
+    intensity_gain: 0.88
+    intensity_offset: 0.015
+    psf_sigma_vox: [0.70, 0.70, 0.95]
+    bias_order: 3
+    bias_coeffs: [-0.16, 0.14, -0.10]
+    coil_count: 8
+    noise_sigma_rel: 0.032
+    g_factor_strength: 0.22
+    voxel_scale: [0.99, 0.99, 1.01]
+    jitter_scale: 0.10
+
+  - site_id: Philips_3T_16ch
+    description: "3T Philips-like 16-channel coil: elevated intensity scale, anisotropic slice filter, moderate bias"
+    contrast_gamma: 1.04
+    intensity_gain: 1.24
+    intensity_offset: -0.005
+    psf_sigma_vox: [0.40, 0.45, 0.75]
+    bias_order: 2
+    bias_coeffs: [0.14, 0.12, -0.12]
+    coil_count: 16
+    noise_sigma_rel: 0.020
+    g_factor_strength: 0.28
+    voxel_scale: [1.01, 1.00, 0.99]
+    jitter_scale: 0.08
+
+  - site_id: Siemens_3T_64ch_HighAccel
+    description: "3T 64-channel high-acceleration coil: sharp center, stronger peripheral g-factor noise amplification"
+    contrast_gamma: 0.88
+    intensity_gain: 0.96
+    intensity_offset: 0.008
+    psf_sigma_vox: [0.20, 0.20, 0.25]
+    bias_order: 3
+    bias_coeffs: [-0.12, -0.14, 0.18]
+    coil_count: 64
+    noise_sigma_rel: 0.026
+    g_factor_strength: 0.45
+    voxel_scale: [1.00, 1.01, 1.00]
+    jitter_scale: 0.09

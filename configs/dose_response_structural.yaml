@@ -1,0 +1,37 @@
+global_seed: 42
+modalities: ["T1w", "T2w", "FLAIR"]
+sampling:
+  mode: dose_response
+  dose_severities: [0.0, 0.25, 0.55, 0.85]
+  include_clean_baseline: true
+  artifacts:
+    - name: motion_3d
+    - name: ghosting_3d
+    - name: wrap_around
+    - name: bias_field
+    - name: rf_spike
+    - name: susceptibility_metal
+    - name: rician_noise
+    - name: fov_cropping
+    - name: gibbs_ringing
+    - name: anisotropy
+    - name: defacing_damage
+sites:
+  - site_id: Siemens_3T_32ch
+    contrast_gamma: 0.96
+    intensity_gain: 1.02
+    psf_sigma_vox: [0.20, 0.20, 0.25]
+    bias_coeffs: [0.06, -0.04, 0.05]
+    coil_count: 32
+    noise_sigma_rel: 0.010
+    g_factor_strength: 0.10
+    jitter_scale: 0.05
+output:
+  save_nifti: true
+  extract_iqms: true
+  render_views: true
+  render_midline: true
+  render_enhanced: true
+  image_format: png
+  write_packets: true
+  manifest_formats: ["parquet", "tsv"]

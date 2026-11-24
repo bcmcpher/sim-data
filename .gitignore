@@ -1,0 +1,24 @@
+# Python & virtual environments
+.venv/
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Local demo / generated simulation outputs
+demo_bids/
+demo_out/
+*.nii
+*.nii.gz
+!tests/**
+
+# OS / editor artifacts
+.DS_Store
+.vscode/
+.idea/
