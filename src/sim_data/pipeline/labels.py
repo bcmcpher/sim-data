@@ -1,9 +1,7 @@
-"""Ground-truth QC target scoring, full-reference fidelity metrics, and manifest writers."""
+"""Defect burden calculation, full-reference fidelity metrics, and TSV manifest writer."""
 
 from __future__ import annotations
 
-import json
-from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
@@ -17,29 +15,32 @@ from sim_data.config import QCThresholdConfig
 from sim_data.io.orientation import AnatomicalPriors, compute_anatomical_priors
 
 
-def compute_qc_targets(
+def compute_defect_summary(
     records: list[ArtifactRecord],
     thresholds: QCThresholdConfig | None = None,
+    include_proxy_labels: bool = False,
 ) -> dict[str, Any]:
-    """Compute composite defect burden, continuous QC score [0, 1], and 3-tier qc-studio label.
+    """Compute tunable continuous `defect_burden` and artifact counts from applied records.
 
-    Combines worst-defect dominance with cumulative multi-artifact burden so either
-    one severe artifact OR multiple moderate artifacts trigger 'fail'.
+    Discrete proxy QC tiers (`proxy_qc_label`, `proxy_qc_rating_int`) are included only
+    when `include_proxy_labels=True`; true categorical QC ratings should come downstream
+    from manual or AI raters.
     """
     thresholds = thresholds or QCThresholdConfig()
     active = [r for r in records if r.severity > 0.0 and not r.params.get("skipped")]
 
     if not active:
-        return {
-            "qc_label": "pass",
-            "qc_rating_int": 1,
-            "qc_score": 1.0,
+        summary: dict[str, Any] = {
             "defect_burden": 0.0,
             "max_artifact_severity": 0.0,
             "num_artifacts": 0,
             "primary_artifact": "none",
             "artifact_names": [],
         }
+        if include_proxy_labels:
+            summary["proxy_qc_label"] = "pass"
+            summary["proxy_qc_rating_int"] = 1
+        return summary
 
     weighted: list[tuple[float, ArtifactRecord]] = []
     for rec in active:
@@ -50,27 +51,26 @@ def compute_qc_targets(
     weighted.sort(key=lambda item: item[0], reverse=True)
     worst = weighted[0][0]
     secondary_sum = sum(val for val, _ in weighted[1:])
-    # Non-linear aggregation: worst defect dominates, additional defects compound burden smoothly
+    # Tunable continuous defect burden equation (worst-defect dominant + cumulative secondary load)
     defect_burden = float(np.clip(worst + 0.30 * secondary_sum * (1.0 - 0.5 * worst), 0.0, 1.0))
-    qc_score = float(np.clip(1.0 - defect_burden, 0.0, 1.0))
 
-    if defect_burden <= thresholds.pass_max_severity:
-        label, rating_int = "pass", 1
-    elif defect_burden <= thresholds.borderline_max_severity:
-        label, rating_int = "borderline", 2
-    else:
-        label, rating_int = "fail", 3
-
-    return {
-        "qc_label": label,
-        "qc_rating_int": rating_int,
-        "qc_score": round(qc_score, 4),
+    summary = {
         "defect_burden": round(defect_burden, 4),
         "max_artifact_severity": round(max(r.severity for r in active), 4),
         "num_artifacts": len(active),
         "primary_artifact": weighted[0][1].name,
         "artifact_names": [r.name for r in active],
     }
+    if include_proxy_labels:
+        if defect_burden <= thresholds.pass_max_severity:
+            label, rating_int = "pass", 1
+        elif defect_burden <= thresholds.borderline_max_severity:
+            label, rating_int = "borderline", 2
+        else:
+            label, rating_int = "fail", 3
+        summary["proxy_qc_label"] = label
+        summary["proxy_qc_rating_int"] = rating_int
+    return summary
 
 
 def compute_fidelity_metrics(
@@ -82,7 +82,6 @@ def compute_fidelity_metrics(
     ref = np.mean(clean_data, axis=3) if clean_data.ndim == 4 else clean_data
     cur = np.mean(sim_data, axis=3) if sim_data.ndim == 4 else sim_data
 
-    # Handle matrix-truncated cropping cleanly
     if cur.shape != ref.shape:
         cur_priors = compute_anatomical_priors(cur)
         retention = float(
@@ -102,7 +101,6 @@ def compute_fidelity_metrics(
     mask = clean_priors.brain_mask
     r_fg = ref[mask].astype(np.float64)
     c_fg = cur[mask].astype(np.float64)
-    # Scale-invariant normalization so pure site gain shifts don't artificially nuke PSNR/SSIM
     r_scale = max(float(np.percentile(r_fg, 95.0)), 1e-6)
     c_scale = max(float(np.percentile(c_fg, 95.0)), 1e-6)
     r_norm = np.clip(ref / r_scale, 0.0, 2.0)
@@ -112,7 +110,6 @@ def compute_fidelity_metrics(
     nrmse = float(np.sqrt(mse))
     psnr = float(min(60.0, 20.0 * np.log10(1.0 / max(nrmse, 1e-4))))
 
-    # Compute 2D SSIM on midline axial slice for speed + stability across small phantom shapes
     mid_z = (clean_priors.bbox_min[2] + clean_priors.bbox_max[2]) // 2
     sl_r = r_norm[:, :, mid_z]
     sl_c = c_norm[:, :, mid_z]
@@ -124,7 +121,6 @@ def compute_fidelity_metrics(
     except Exception:
         ssim_val = 0.0
 
-    # Retained positive foreground brain fraction (drops under cropping/defacing/severe voids)
     thresh_alive = 0.05 * c_scale
     retention = float(np.mean(cur[mask] > thresh_alive))
 
@@ -136,29 +132,12 @@ def compute_fidelity_metrics(
     }
 
 
-def write_manifest(
+def write_manifest_tsv(
     rows: list[dict[str, Any]],
-    out_dir: str | Path,
-    formats: Sequence[str],
-) -> dict[str, Path]:
-    """Persist unified simulation manifest as Parquet, TSV, and/or JSON."""
-    out_root = Path(out_dir)
-    out_root.mkdir(parents=True, exist_ok=True)
-    df = pd.DataFrame(rows)
-    written: dict[str, Path] = {}
-
-    for fmt in formats:
-        if fmt == "parquet":
-            p = out_root / "manifest.parquet"
-            df.to_parquet(p, index=False)
-            written["parquet"] = p
-        elif fmt == "tsv":
-            p = out_root / "manifest.tsv"
-            df.to_csv(p, sep="\t", index=False)
-            written["tsv"] = p
-        elif fmt == "json":
-            p = out_root / "manifest.json"
-            p.write_text(json.dumps(rows, indent=2), encoding="utf-8")
-            written["json"] = p
-
-    return written
+    manifest_path: str | Path,
+) -> Path:
+    """Persist official ground-truth simulation manifest as a single BIDS-friendly TSV."""
+    target = Path(manifest_path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(rows).to_csv(target, sep="\t", index=False)
+    return target

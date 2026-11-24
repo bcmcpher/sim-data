@@ -16,9 +16,9 @@ import pandas as pd
 from scipy import stats
 from sklearn.decomposition import PCA
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import cohen_kappa_score, f1_score, roc_auc_score
-from sklearn.model_selection import StratifiedKFold
+from sklearn.linear_model import LogisticRegression, Ridge
+from sklearn.metrics import cohen_kappa_score, f1_score, r2_score, roc_auc_score
+from sklearn.model_selection import KFold, StratifiedKFold
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
@@ -32,6 +32,45 @@ class HarmonizationAuditResult:
     plot_path: Path | None
     combat_df: pd.DataFrame
     covbat_df: pd.DataFrame
+
+
+def merge_manifest_and_iqms(
+    manifest_df: pd.DataFrame,
+    iqms_df: pd.DataFrame | None = None,
+) -> pd.DataFrame:
+    """Optionally join an external blind IQM TSV (sim-data extract-iqms or MRIQC/QSIPrep) onto manifest."""
+    if iqms_df is None:
+        return manifest_df.copy()
+
+    ext = iqms_df.copy()
+    # Support both `scan_id` (sim-data) and `bids_name` (MRIQC group TSVs)
+    if "scan_id" not in ext.columns and "bids_name" in ext.columns:
+        ext["scan_id"] = ext["bids_name"].astype(str)
+
+    if "scan_id" not in ext.columns:
+        raise ValueError("External IQMs table must contain a 'scan_id' or 'bids_name' column")
+
+    meta_skip = {"scan_id", "bids_name", "nifti_path", "subject", "session", "modality"}
+    rename_map: dict[str, str] = {}
+    iqm_keep = ["scan_id"]
+    for col in ext.columns:
+        if col in meta_skip:
+            continue
+        if col.startswith("iqm_"):
+            iqm_keep.append(col)
+        elif pd.api.types.is_numeric_dtype(ext[col]):
+            new_name = f"iqm_{col}"
+            rename_map[col] = new_name
+            iqm_keep.append(new_name)
+
+    ext = ext.rename(columns=rename_map)
+    ext = ext[[c for c in iqm_keep if c in ext.columns]]
+    # Drop any overlapping iqm_* columns from manifest before joining fresh external IQMs
+    base = manifest_df.drop(
+        columns=[c for c in manifest_df.columns if c in ext.columns and c != "scan_id"],
+        errors="ignore",
+    )
+    return base.merge(ext, on="scan_id", how="inner")
 
 
 def _select_iqm_columns(df: pd.DataFrame) -> list[str]:
@@ -61,7 +100,6 @@ def _site_location_scale_stats(
         f_val, _ = stats.f_oneway(*groups)
         if np.isfinite(f_val):
             f_stats.append(float(f_val))
-        # Eta-squared (fraction of variance explained by site)
         grand = float(np.mean(X_std[:, j]))
         ss_between = sum(len(g) * (float(np.mean(g)) - grand) ** 2 for g in groups)
         ss_total = float(np.sum((X_std[:, j] - grand) ** 2)) + 1e-10
@@ -84,11 +122,7 @@ def _covariance_and_correlation_divergence(
     sites: np.ndarray,
     covars: np.ndarray | None = None,
 ) -> tuple[float, float]:
-    """Mean pairwise Frobenius distance between per-site residual covariance & correlation matrices.
-
-    Standardizes residuals by the pooled within-site SD (not total pooled SD) so that
-    removing between-site location shifts does not artificially inflate covariance scale.
-    """
+    """Mean pairwise Frobenius distance between per-site residual covariance & correlation matrices."""
     unique_sites = sorted(pd.unique(sites).tolist())
     n_samples = X.shape[0]
     if covars is not None and covars.size > 0:
@@ -101,7 +135,6 @@ def _covariance_and_correlation_divergence(
     else:
         E = X - np.mean(X, axis=0, keepdims=True)
 
-    # Pooled within-site SD
     E_centered = np.empty_like(E)
     for s in unique_sites:
         m = sites == s
@@ -161,8 +194,21 @@ def _cv_site_predictability(X: np.ndarray, sites: np.ndarray, seed: int = 42) ->
     return (lr_auc, rf_auc)
 
 
+def _cv_burden_preservation(X: np.ndarray, burden: np.ndarray, seed: int = 42) -> float:
+    """Cross-validated Ridge R^2 predicting continuous defect_burden from IQMs."""
+    if len(burden) < 6 or float(np.std(burden)) <= 1e-8:
+        return 0.0
+    kf = KFold(n_splits=min(5, len(burden)), shuffle=True, random_state=seed)
+    preds = np.zeros_like(burden, dtype=np.float64)
+    reg = Pipeline([("scaler", StandardScaler()), ("ridge", Ridge(alpha=5.0))])
+    for tr, te in kf.split(X):
+        reg.fit(X[tr], burden[tr])
+        preds[te] = reg.predict(X[te])
+    return round(float(r2_score(burden, preds)), 4)
+
+
 def _cv_qc_preservation(X: np.ndarray, qc_labels: np.ndarray, seed: int = 42) -> dict[str, float]:
-    """Cross-validated LogisticRegression predicting pass/borderline/fail from IQMs."""
+    """Cross-validated LogisticRegression predicting categorical ratings if provided."""
     y = pd.Categorical(qc_labels).codes
     classes, counts = np.unique(y, return_counts=True)
     if len(classes) < 2 or int(counts.min()) < 2:
@@ -191,29 +237,33 @@ def _evaluate_stage(
     df: pd.DataFrame,
     feature_cols: list[str],
     site_col: str,
-    qc_col: str,
+    qc_col: str | None,
     covar_cols: list[str] | None = None,
     seed: int = 42,
 ) -> dict[str, Any]:
     X = df[feature_cols].to_numpy(dtype=np.float64)
     sites = df[site_col].astype(str).to_numpy()
-    qc = df[qc_col].astype(str).to_numpy() if qc_col in df.columns else np.zeros(len(df), dtype=str)
     covars = df[covar_cols].to_numpy(dtype=np.float64) if covar_cols else None
 
     X_std = StandardScaler().fit_transform(X)
     loc_scale = _site_location_scale_stats(X_std, sites)
     cov_fro, corr_fro = _covariance_and_correlation_divergence(X, sites, covars=covars)
     site_linear_auc, site_rf_auc = _cv_site_predictability(X, sites, seed=seed)
-    qc_metrics = _cv_qc_preservation(X, qc, seed=seed) if qc_col in df.columns else {}
 
-    return {
+    result: dict[str, Any] = {
         **loc_scale,
         "covariance_frobenius_dist": cov_fro,
         "correlation_frobenius_dist": corr_fro,
         "site_linear_auc": site_linear_auc,
         "site_rf_auc": site_rf_auc,
-        **qc_metrics,
     }
+    if "defect_burden" in df.columns:
+        burden = pd.to_numeric(df["defect_burden"], errors="coerce").fillna(0.0).to_numpy(dtype=np.float64)
+        result["defect_burden_r2"] = _cv_burden_preservation(X, burden, seed=seed)
+    if qc_col and qc_col in df.columns:
+        qc = df[qc_col].astype(str).to_numpy()
+        result.update(_cv_qc_preservation(X, qc, seed=seed))
+    return result
 
 
 def _plot_pca_comparison(
@@ -233,7 +283,13 @@ def _plot_pca_comparison(
         pcs = PCA(n_components=min(2, X.shape[1])).fit_transform(X)
         for s in unique_sites:
             mask = frame[site_col].astype(str).to_numpy() == s
-            ax.scatter(pcs[mask, 0], pcs[mask, 1] if pcs.shape[1] > 1 else np.zeros(mask.sum()), label=s, alpha=0.75, s=26)
+            ax.scatter(
+                pcs[mask, 0],
+                pcs[mask, 1] if pcs.shape[1] > 1 else np.zeros(mask.sum()),
+                label=s,
+                alpha=0.75,
+                s=26,
+            )
         ax.set_title(title, fontsize=10)
         ax.set_xlabel("PC1", fontsize=8)
         ax.set_ylabel("PC2", fontsize=8)
@@ -248,34 +304,42 @@ def _plot_pca_comparison(
 def run_harmonization_audit(
     manifest_df: pd.DataFrame,
     out_dir: str | Path,
+    iqms_df: pd.DataFrame | None = None,
     modality: str | None = None,
     site_col: str = "site_id",
-    qc_col: str = "qc_label",
+    qc_col: str | None = None,
     protect_covars: list[str] | None = None,
     backend: str = "auto",
     seed: int = 42,
 ) -> HarmonizationAuditResult:
-    """Run ComBat and CovBat on extracted IQMs and emit a quantitative audit report + PCA plot."""
+    """Run ComBat and CovBat on IQMs (inline or external TSV) and emit audit report + TSVs + plot."""
     out_root = Path(out_dir)
     out_root.mkdir(parents=True, exist_ok=True)
 
-    df = manifest_df.copy()
+    df = merge_manifest_and_iqms(manifest_df, iqms_df)
     if modality is not None and "modality" in df.columns:
         df = df[df["modality"] == modality].reset_index(drop=True)
     elif "modality" in df.columns and df["modality"].nunique() > 1:
-        # Default to most abundant structural modality (or largest modality group)
         counts = df["modality"].value_counts()
         modality = str(counts.index[0])
         df = df[df["modality"] == modality].reset_index(drop=True)
 
     feature_cols = _select_iqm_columns(df)
     if len(feature_cols) < 2:
-        raise ValueError(f"Need at least 2 varying IQM columns for harmonization, found {feature_cols}")
+        raise ValueError(
+            "Need at least 2 varying iqm_* columns for harmonization. "
+            "Pass an external --iqms TSV (from `sim-data extract-iqms` or MRIQC/QSIPrep)."
+        )
 
-    # Impute any sporadic NaNs cleanly with column medians
     for col in feature_cols:
         df[col] = pd.to_numeric(df[col], errors="coerce")
         df[col] = df[col].fillna(df[col].median())
+
+    if qc_col is None:
+        for cand in ("qc_label", "proxy_qc_label"):
+            if cand in df.columns:
+                qc_col = cand
+                break
 
     covar_cols = protect_covars
     if covar_cols is None:
@@ -289,12 +353,16 @@ def run_harmonization_audit(
     )
 
     raw_stats = _evaluate_stage(df, feature_cols, site_col, qc_col, covar_cols=covar_cols, seed=seed)
-    combat_stats = _evaluate_stage(combat_df, feature_cols, site_col, qc_col, covar_cols=covar_cols, seed=seed)
-    covbat_stats = _evaluate_stage(covbat_df, feature_cols, site_col, qc_col, covar_cols=covar_cols, seed=seed)
+    combat_stats = _evaluate_stage(
+        combat_df, feature_cols, site_col, qc_col, covar_cols=covar_cols, seed=seed
+    )
+    covbat_stats = _evaluate_stage(
+        covbat_df, feature_cols, site_col, qc_col, covar_cols=covar_cols, seed=seed
+    )
 
     report: dict[str, Any] = {
         "modality": modality or "all",
-        "n_scans": len(df),
+        "n_scans": int(len(df)),
         "sites": sorted(df[site_col].astype(str).unique().tolist()),
         "n_iqm_features": len(feature_cols),
         "iqm_features": feature_cols,
@@ -336,8 +404,8 @@ def run_harmonization_audit(
 
     report_path = out_root / "harmonization_report.json"
     report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
-    combat_df.to_parquet(out_root / "iqms_combat.parquet", index=False)
-    covbat_df.to_parquet(out_root / "iqms_covbat.parquet", index=False)
+    combat_df.to_csv(out_root / "iqms_combat.tsv", sep="\t", index=False)
+    covbat_df.to_csv(out_root / "iqms_covbat.tsv", sep="\t", index=False)
 
     plot_path = out_root / "site_pca_comparison.png"
     _plot_pca_comparison(df, combat_df, covbat_df, feature_cols, site_col, plot_path)

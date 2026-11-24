@@ -4,6 +4,7 @@ sampling:
   mode: dose_response
   dose_severities: [0.0, 0.25, 0.55, 0.85]
   include_clean_baseline: true
+  shuffle_run_order: true
   artifacts:
     - name: motion_3d
     - name: ghosting_3d
@@ -28,10 +29,9 @@ sites:
     jitter_scale: 0.05
 output:
   save_nifti: true
-  extract_iqms: true
-  render_views: true
-  render_midline: true
-  render_enhanced: true
-  image_format: png
-  write_packets: true
-  manifest_formats: ["parquet", "tsv"]
+  write_bids_metadata: true
+  site_naming: none
+  extract_iqms: false
+  render_views: false
+  write_packets: false
+  include_proxy_qc_labels: false

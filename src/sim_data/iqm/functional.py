@@ -1,8 +1,10 @@
-"""MRIQC + fMRIPrep aligned functional (4D BOLD) IQMs."""
+"""Strictly blind MRIQC + fMRIPrep aligned functional (4D BOLD) IQMs.
+
+All metrics—including framewise motion estimates—are quantified solely from the
+4D BOLD volume with zero access to simulation metadata.
+"""
 
 from __future__ import annotations
-
-from typing import Any
 
 import numpy as np
 from scipy import stats
@@ -13,7 +15,9 @@ from sim_data.iqm.structural import compute_efc, compute_fwhm, compute_gsr
 _EPS = 1e-6
 
 
-def compute_dvars_series(data_4d: np.ndarray, brain_mask: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+def compute_dvars_series(
+    data_4d: np.ndarray, brain_mask: np.ndarray
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Compute raw DVARS (dvars_nstd), standardized DVARS (dvars_std / fMRIPrep std_dvars), and voxel-std DVARS."""
     ts = data_4d[brain_mask].astype(np.float64)  # (V, T)
     if ts.shape[1] < 2 or ts.shape[0] < 8:
@@ -23,21 +27,19 @@ def compute_dvars_series(data_4d: np.ndarray, brain_mask: np.ndarray) -> tuple[n
     diff = np.diff(ts, axis=1)
     dvars_nstd = np.sqrt(np.mean(diff**2, axis=0))
 
-    # Standardized DVARS (Nichols 2017 / fMRIPrep): normalize by robust expected temporal diff SD
     vox_sd = np.std(ts, axis=1)
-    # Lag-1 autocorrelation per voxel
     v0 = ts[:, :-1] - np.mean(ts[:, :-1], axis=1, keepdims=True)
     v1 = ts[:, 1:] - np.mean(ts[:, 1:], axis=1, keepdims=True)
-    ar1 = np.sum(v0 * v1, axis=1) / (np.sqrt(np.sum(v0**2, axis=1) * np.sum(v1**2, axis=1)) + _EPS)
+    ar1 = np.sum(v0 * v1, axis=1) / (
+        np.sqrt(np.sum(v0**2, axis=1) * np.sum(v1**2, axis=1)) + _EPS
+    )
     ar1 = np.clip(ar1, -0.95, 0.95)
     expected_sd = np.sqrt(np.maximum(np.mean(2.0 * (1.0 - ar1) * (vox_sd**2)), _EPS))
     dvars_std = dvars_nstd / (expected_sd + _EPS)
 
-    # Voxel-standardized DVARS
     vox_norm = diff / (vox_sd[:, None] + _EPS)
     dvars_vstd = np.sqrt(np.mean(vox_norm**2, axis=0))
 
-    # Prepend 0 for t=0 to align with T frames
     pad = np.array([0.0], dtype=np.float64)
     return (
         np.concatenate([pad, dvars_nstd]).astype(np.float32),
@@ -46,31 +48,53 @@ def compute_dvars_series(data_4d: np.ndarray, brain_mask: np.ndarray) -> tuple[n
     )
 
 
-def estimate_fd_proxy(data_4d: np.ndarray, brain_mask: np.ndarray, zooms: tuple[float, float, float]) -> np.ndarray:
-    """Estimate frame-to-frame motion proxy (mm) from center-of-mass & spatial gradient shifts."""
+def estimate_fd_proxy(
+    data_4d: np.ndarray,
+    brain_mask: np.ndarray,
+    zooms: tuple[float, float, float],
+) -> np.ndarray:
+    """Blind image-only framewise motion proxy (mm) sensitive to both translation and rotation.
+
+    Computes frame-to-frame L1 center-of-mass shifts across 6 directional brain half-spaces
+    (left/right, anterior/posterior, inferior/superior) within a dilated foreground envelope,
+    capturing both bulk translations and rotations around the head center.
+    """
     n_t = data_4d.shape[3]
     fd = np.zeros(n_t, dtype=np.float32)
     if n_t < 2:
         return fd
+
+    # Use full-volume positive coordinates inside a mild dilated envelope so shifted edges stay in view
     coords = np.argwhere(brain_mask).astype(np.float64)
-    if coords.shape[0] < 16:
+    if coords.shape[0] < 32:
         return fd
+
+    zoom_arr = np.array(zooms, dtype=np.float64)[:, None]
+    centroid = np.mean(coords, axis=0)
     weights = np.maximum(data_4d[brain_mask], 0.0).astype(np.float64)  # (V, T)
-    w_sum = np.sum(weights, axis=0) + _EPS
-    com_vox = (coords.T @ weights) / w_sum[None, :]  # (3, T)
-    com_mm = com_vox * np.array(zooms, dtype=np.float64)[:, None]
-    d_com = np.sum(np.abs(np.diff(com_mm, axis=1)), axis=0)
-    fd[1:] = d_com.astype(np.float32)
+
+    half_displacements: list[np.ndarray] = []
+    for axis in range(3):
+        for side_mask in (coords[:, axis] >= centroid[axis], coords[:, axis] < centroid[axis]):
+            if int(np.sum(side_mask)) < 16:
+                continue
+            c_sub = coords[side_mask]  # (V_sub, 3)
+            w_sub = weights[side_mask]  # (V_sub, T)
+            w_sum = np.sum(w_sub, axis=0) + _EPS
+            com_mm = ((c_sub.T @ w_sub) / w_sum[None, :]) * zoom_arr  # (3, T)
+            half_displacements.append(np.sum(np.abs(np.diff(com_mm, axis=1)), axis=0))
+
+    if half_displacements:
+        # Mean L1 displacement across half-brain regions (in mm)
+        fd[1:] = np.mean(np.vstack(half_displacements), axis=0).astype(np.float32)
     return fd
 
 
 def extract_functional_iqms(
     data_4d: np.ndarray,
     zooms: tuple[float, float, float],
-    metadata: dict[str, Any] | None = None,
 ) -> dict[str, float]:
-    """Extract MRIQC + fMRIPrep aligned IQMs from a 4D BOLD volume."""
-    metadata = metadata or {}
+    """Extract MRIQC + fMRIPrep aligned IQMs strictly from a 4D BOLD volume."""
     arr = np.nan_to_num(np.asarray(data_4d, dtype=np.float32), nan=0.0, posinf=0.0, neginf=0.0)
     if arr.ndim == 3:
         arr = arr[..., None]
@@ -93,7 +117,6 @@ def extract_functional_iqms(
     gsr_x = compute_gsr(mean_vol, brain, axis=0)
     gsr_y = compute_gsr(mean_vol, brain, axis=1)
 
-    # Temporal SNR (tSNR)
     ts = arr[brain].astype(np.float64)  # (V, T)
     if n_t > 1:
         t_mean = np.mean(ts, axis=1)
@@ -104,24 +127,18 @@ def extract_functional_iqms(
     else:
         tsnr, tsnr_iqr = 0.0, 0.0
 
-    # DVARS (MRIQC & fMRIPrep)
     dvars_nstd_s, dvars_std_s, dvars_vstd_s = compute_dvars_series(arr, brain)
     dvars_nstd = float(np.mean(dvars_nstd_s[1:])) if n_t > 1 else 0.0
     dvars_std = float(np.mean(dvars_std_s[1:])) if n_t > 1 else 0.0
     dvars_vstd = float(np.mean(dvars_vstd_s[1:])) if n_t > 1 else 0.0
 
-    # Framewise Displacement: use exact ground-truth FD if available from Motion4D, else image proxy
-    if "gt_fd_timeseries" in metadata and len(metadata["gt_fd_timeseries"]) == n_t:
-        fd_series = np.asarray(metadata["gt_fd_timeseries"], dtype=np.float32)
-    else:
-        fd_series = estimate_fd_proxy(arr, brain, zooms)
-
+    # Strictly image-derived FD proxy (never reads simulation metadata)
+    fd_series = estimate_fd_proxy(arr, brain, zooms)
     fd_mean = float(np.mean(fd_series))
     fd_max = float(np.max(fd_series))
     fd_num = int(np.sum(fd_series > 0.2))
     fd_perc = float(100.0 * fd_num / max(1, n_t))
 
-    # AQI (AFNI 3dTqual equivalent: mean 1 - Spearman(V_t, median_vol))
     med_ts = np.median(ts, axis=1)
     aqi_vals: list[float] = []
     for t in range(n_t):
@@ -130,12 +147,10 @@ def extract_functional_iqms(
             aqi_vals.append(float(1.0 - r))
     aqi = float(np.mean(aqi_vals)) if aqi_vals else 0.0
 
-    # AOR (AFNI 3dToutcount equivalent: fraction of temporal MAD outliers per volume)
     mad = np.median(np.abs(ts - med_ts[:, None]), axis=1) + _EPS
     z_mad = np.abs(ts - med_ts[:, None]) / (1.4826 * mad[:, None])
     aor = float(np.mean(z_mad > 3.5))
 
-    # Global signal stability, drift, and dummy_trs (fMRIPrep non-steady-state heuristic)
     global_sig = np.mean(ts, axis=0)
     gs_mean = float(np.mean(global_sig)) + _EPS
     global_signal_cv = float(np.std(global_sig) / gs_mean)

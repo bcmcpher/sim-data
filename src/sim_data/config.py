@@ -10,15 +10,11 @@ from pydantic import BaseModel, Field, field_validator
 
 Modality = Literal["T1w", "T2w", "FLAIR", "bold", "dwi"]
 SamplingMode = Literal["dose_response", "combinatorial", "multisite_factorial"]
-ManifestFormat = Literal["parquet", "tsv", "json"]
+SiteNaming = Literal["desc", "none"]
 
 
 def _default_modalities() -> list[Modality]:
     return ["T1w", "T2w", "FLAIR", "bold", "dwi"]
-
-
-def _default_manifest_formats() -> list[ManifestFormat]:
-    return ["parquet", "tsv"]
 
 
 class ArtifactSpec(BaseModel):
@@ -60,7 +56,7 @@ class SiteProfileConfig(BaseModel):
 
 
 class QCThresholdConfig(BaseModel):
-    """Thresholds mapping composite defect burden into 3-tier qc-studio labels."""
+    """Optional thresholds mapping defect_burden into 3-tier proxy labels (when opted in)."""
 
     pass_max_severity: float = Field(default=0.22, ge=0.0, le=1.0)
     borderline_max_severity: float = Field(default=0.56, ge=0.0, le=1.0)
@@ -79,6 +75,7 @@ class SamplingPlanConfig(BaseModel):
 
     mode: SamplingMode = "combinatorial"
     include_clean_baseline: bool = True
+    shuffle_run_order: bool = True
     dose_severities: list[float] = Field(default_factory=lambda: [0.0, 0.25, 0.55, 0.85])
     samples_per_scan: int = Field(default=4, ge=1)
     samples_per_scan_per_site: int = Field(default=2, ge=1)
@@ -90,16 +87,24 @@ class SamplingPlanConfig(BaseModel):
 
 
 class OutputConfig(BaseModel):
-    """Controls what artifacts, IQMs, views, packets, and manifests are written."""
+    """Controls blinded BIDS outputs and optional downstream diagnostics.
+
+    By default, `sim-data generate` writes only blinded BIDS NIfTI/JSON/bval/bvec files,
+    BIDS root metadata (dataset_description.json, participants.tsv, *_scans.tsv, .bidsignore),
+    and the official ground-truth `manifest.tsv`. IQM extraction, 2D view rendering,
+    packet.json assembly, and categorical proxy QC labels are opt-in.
+    """
 
     save_nifti: bool = True
-    extract_iqms: bool = True
-    render_views: bool = True
+    write_bids_metadata: bool = True
+    site_naming: SiteNaming = "desc"
+    extract_iqms: bool = False
+    render_views: bool = False
     render_midline: bool = True
     render_enhanced: bool = True
     image_format: Literal["png", "webp"] = "png"
-    write_packets: bool = True
-    manifest_formats: list[ManifestFormat] = Field(default_factory=_default_manifest_formats)
+    write_packets: bool = False
+    include_proxy_qc_labels: bool = False
     qc_thresholds: QCThresholdConfig = Field(default_factory=QCThresholdConfig)
 
 

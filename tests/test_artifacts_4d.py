@@ -1,4 +1,4 @@
-"""Unit & NiPreps IQM tests for 4D BOLD (fMRIPrep/MRIQC) and 4D DWI (QSIPrep/MRIQC) artifacts."""
+"""Unit & blind NiPreps IQM tests for 4D BOLD (fMRIPrep/MRIQC) and 4D DWI (QSIPrep/MRIQC)."""
 
 from __future__ import annotations
 
@@ -47,17 +47,17 @@ def _make_4d_context(
     )
 
 
-def test_bold_motion_4d_increases_fd_dvars_and_aqi(bids_phantom_dir: Path) -> None:
+def test_bold_motion_4d_increases_blind_fd_dvars_and_aqi(bids_phantom_dir: Path) -> None:
     ctx_clean = _make_4d_context(bids_phantom_dir, "bold", seed=10)
     iqm_clean = extract_functional_iqms(ctx_clean.data, ctx_clean.zooms)
 
     ctx_mod = _make_4d_context(bids_phantom_dir, "bold", seed=10)
     create_artifact("motion_4d", severity=0.35).apply(ctx_mod)
-    iqm_mod = extract_functional_iqms(ctx_mod.data, ctx_mod.zooms, metadata=ctx_mod.metadata)
+    iqm_mod = extract_functional_iqms(ctx_mod.data, ctx_mod.zooms)
 
     ctx_sev = _make_4d_context(bids_phantom_dir, "bold", seed=10)
     create_artifact("motion_4d", severity=0.85).apply(ctx_sev)
-    iqm_sev = extract_functional_iqms(ctx_sev.data, ctx_sev.zooms, metadata=ctx_sev.metadata)
+    iqm_sev = extract_functional_iqms(ctx_sev.data, ctx_sev.zooms)
 
     assert iqm_clean["fd_mean"] < iqm_mod["fd_mean"] < iqm_sev["fd_mean"]
     assert iqm_sev["dvars_nstd"] > iqm_clean["dvars_nstd"]
@@ -115,7 +115,6 @@ def test_dwi_motion_preserves_unrotated_bvecs_by_default_and_rotates_on_flag(
     ctx_prep = _make_4d_context(bids_phantom_dir, "dwi", seed=50, rotate_bvecs=True)
     create_artifact("motion_4d", severity=0.80).apply(ctx_prep)
     assert not np.allclose(ctx_prep.bvecs, orig_bvecs, atol=1e-4)
-    # Unit norms preserved on high-b vectors
     high_b = ctx_prep.bvals > 150.0
     norms = np.linalg.norm(ctx_prep.bvecs[:, high_b], axis=0)
     assert np.allclose(norms, 1.0, atol=1e-4)

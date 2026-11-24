@@ -1,4 +1,4 @@
-"""Experimental recipe samplers: dose-response, combinatorial mixtures, and multi-site factorial."""
+"""Experimental recipe samplers with blinded, shuffled sequential run assignment."""
 
 from __future__ import annotations
 
@@ -22,13 +22,14 @@ class PlannedArtifact:
 
 @dataclass
 class ScanRecipe:
-    """Complete deterministic specification for simulating one scan."""
+    """Complete deterministic specification for simulating one blinded BIDS run."""
 
     recipe_id: str
     scan: BIDSScan
     site: SiteProfileConfig
     artifacts: list[PlannedArtifact]
     seed: int
+    run_index: int = 1
     rotate_dwi_bvecs: bool = False
 
 
@@ -74,15 +75,50 @@ def _sample_combination(
         spec = specs[int(idx)]
         lo, hi = spec.severity_range or default_range
         sev = float(rng.uniform(lo, hi))
-        planned.append(PlannedArtifact(name=spec.name, severity=round(sev, 4), params=dict(spec.params)))
+        planned.append(
+            PlannedArtifact(name=spec.name, severity=round(sev, 4), params=dict(spec.params))
+        )
     return planned
+
+
+def _assign_blinded_runs(
+    recipes: list[ScanRecipe],
+    config: SimulationConfig,
+) -> list[ScanRecipe]:
+    """Assign sequential `run-01..run-N` numbers per BIDS stem group, shuffled to prevent order leakage."""
+    groups: dict[tuple[str, str, str, str, str], list[ScanRecipe]] = {}
+    for rec in recipes:
+        site_key = rec.site.site_id if config.output.site_naming == "desc" else ""
+        task_key = rec.scan.entities.get("task", "")
+        group_key: tuple[str, str, str, str, str] = (
+            rec.scan.subject,
+            rec.scan.session or "",
+            task_key,
+            str(rec.scan.modality),
+            site_key,
+        )
+        groups.setdefault(group_key, []).append(rec)
+
+    ordered: list[ScanRecipe] = []
+    for group_key in sorted(groups):
+        bucket = list(groups[group_key])
+        if config.sampling.shuffle_run_order and len(bucket) > 1:
+            shuf_seed = derive_seed(config.global_seed, f"run_shuffle:{':'.join(group_key)}")
+            rng = np.random.default_rng(shuf_seed)
+            perm = rng.permutation(len(bucket))
+            bucket = [bucket[int(i)] for i in perm]
+        for idx, rec in enumerate(bucket, start=1):
+            rec.run_index = idx
+            ordered.append(rec)
+
+    return ordered
 
 
 def build_recipes(
     scans: list[BIDSScan],
     config: SimulationConfig,
 ) -> list[ScanRecipe]:
-    """Expand BIDS scans + SimulationConfig into deterministic ScanRecipes."""
+    """Expand BIDS scans + SimulationConfig into deterministic blinded ScanRecipes."""
     sites = config.sites if config.sites else [_default_site()]
     sampling = config.sampling
     recipes: list[ScanRecipe] = []
@@ -111,7 +147,11 @@ def build_recipes(
                         continue
                     rid = f"dose{spec.name[:6]}{sev_idx:02d}"
                     arts = (
-                        [PlannedArtifact(name=spec.name, severity=float(sev), params=dict(spec.params))]
+                        [
+                            PlannedArtifact(
+                                name=spec.name, severity=float(sev), params=dict(spec.params)
+                            )
+                        ]
                         if sev > 0.0
                         else []
                     )
@@ -121,7 +161,9 @@ def build_recipes(
                             scan=scan,
                             site=site,
                             artifacts=arts,
-                            seed=derive_seed(config.global_seed, f"{scan.base_id}:{site.site_id}:{rid}"),
+                            seed=derive_seed(
+                                config.global_seed, f"{scan.base_id}:{site.site_id}:{rid}"
+                            ),
                             rotate_dwi_bvecs=sampling.rotate_dwi_bvecs,
                         )
                     )
@@ -190,4 +232,4 @@ def build_recipes(
                         )
                     )
 
-    return recipes
+    return _assign_blinded_runs(recipes, config)

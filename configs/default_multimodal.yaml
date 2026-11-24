@@ -3,6 +3,7 @@ modalities: ["T1w", "T2w", "FLAIR", "bold", "dwi"]
 sampling:
   mode: multisite_factorial
   include_clean_baseline: true
+  shuffle_run_order: true
   samples_per_scan_per_site: 3
   min_artifacts: 1
   max_artifacts: 3
@@ -82,13 +83,9 @@ sites:
     jitter_scale: 0.08
 output:
   save_nifti: true
-  extract_iqms: true
-  render_views: true
-  render_midline: true
-  render_enhanced: true
-  image_format: png
-  write_packets: true
-  manifest_formats: ["parquet", "tsv"]
-  qc_thresholds:
-    pass_max_severity: 0.22
-    borderline_max_severity: 0.56
+  write_bids_metadata: true
+  site_naming: desc
+  extract_iqms: false
+  render_views: false
+  write_packets: false
+  include_proxy_qc_labels: false

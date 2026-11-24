@@ -69,7 +69,6 @@ def test_structural_artifact_runs_and_is_deterministic(
     assert rec_a.severity == pytest.approx(0.65)
     assert np.all(np.isfinite(ctx_a.data))
     assert np.allclose(ctx_a.data, ctx_b.data, rtol=1e-4, atol=1e-3)
-    # Non-trivial modification occurred
     assert float(np.mean(np.abs(ctx_a.data - clean))) > 1e-3
     assert rec_a.params == rec_b.params
 
@@ -80,7 +79,7 @@ def test_rician_noise_degrades_snrd_monotonically(bids_phantom_dir: Path) -> Non
     for sev in (0.0, 0.35, 0.85):
         ctx, _ = _make_t1_context(bids_phantom_dir, seed=303)
         create_artifact("rician_noise", severity=sev).apply(ctx)
-        iqm = extract_structural_iqms(ctx.data, zooms=ctx.zooms, clean_priors=ctx.priors)
+        iqm = extract_structural_iqms(ctx.data, zooms=ctx.zooms)
         snrds.append(iqm["snrd_total"])
         bg_means.append(iqm["summary_bg_mean"])
 
@@ -113,8 +112,9 @@ def test_anisotropy_increases_slice_fwhm(bids_phantom_dir: Path) -> None:
 
 def test_defacing_damage_is_post_noise_zero_and_reduces_retention(bids_phantom_dir: Path) -> None:
     ctx, clean = _make_t1_context(bids_phantom_dir, seed=606)
-    # Apply Rician noise first (Stage 50), then DefacingDamage (Stage 60)
     create_artifact("rician_noise", severity=0.30).apply(ctx)
+    iqm_before = extract_structural_iqms(ctx.data, zooms=ctx.zooms)
+
     rec = create_artifact(
         "defacing_damage", severity=0.85, params={"pattern": "anterior_wedge"}
     ).apply(ctx)
@@ -123,9 +123,10 @@ def test_defacing_damage_is_post_noise_zero_and_reduces_retention(bids_phantom_d
     fid = compute_fidelity_metrics(clean, ctx.data, ctx.priors)
     assert fid["brain_mask_retention"] < 0.95
 
-    iqm = extract_structural_iqms(ctx.data, zooms=ctx.zooms, clean_priors=ctx.priors)
-    # Post-noise defacing leaves exact zero-valued voxels in anterior-inferior ROI
-    assert iqm["anterior_inferior_zero_ratio"] > 0.10
+    # Blind image-only anterior_inferior_zero_ratio jumps strictly from ~0 to >0.10
+    iqm_after = extract_structural_iqms(ctx.data, zooms=ctx.zooms)
+    assert iqm_before["anterior_inferior_zero_ratio"] < 0.01
+    assert iqm_after["anterior_inferior_zero_ratio"] > 0.10
 
 
 def test_fov_cropping_truncate_matrix_updates_affine(bids_phantom_dir: Path) -> None:

@@ -1,8 +1,10 @@
-"""QSIPrep ImageQC + MRIQC-dMRI aligned diffusion (4D DWI) IQMs."""
+"""Strictly blind QSIPrep ImageQC + MRIQC-dMRI aligned diffusion (4D DWI) IQMs.
+
+All metrics are quantified solely from the modified 4D DWI NIfTI and .bval/.bvec files
+with zero access to simulation metadata.
+"""
 
 from __future__ import annotations
-
-from typing import Any
 
 import numpy as np
 
@@ -19,11 +21,7 @@ def compute_neighbor_dwi_corr(
     bvals: np.ndarray | None = None,
     bvecs: np.ndarray | None = None,
 ) -> float:
-    """Compute QSIPrep / DSI Studio raw_neighbor_corr (Neighboring DWI Correlation / NDC).
-
-    For each high-b volume, finds its angularly closest neighbor on the same shell
-    (or adjacent volume if bvecs unavailable) and computes Pearson correlation inside brain_mask.
-    """
+    """Compute QSIPrep / DSI Studio raw_neighbor_corr (Neighboring DWI Correlation / NDC)."""
     n_vols = data_4d.shape[3]
     if n_vols < 2:
         return 1.0
@@ -36,7 +34,6 @@ def compute_neighbor_dwi_corr(
 
     vecs = data_4d[brain_mask][:, dw_idx].astype(np.float64)  # (V, M)
     m = vecs.shape[1]
-    # Center & normalize columns for fast correlation
     centered = vecs - np.mean(vecs, axis=0, keepdims=True)
     norms = np.linalg.norm(centered, axis=0, keepdims=True) + _EPS
     unit = centered / norms
@@ -64,14 +61,11 @@ def compute_bad_slices_qsiprep(
     slice_axis: int = 2,
     bvals: np.ndarray | None = None,
 ) -> tuple[int, np.ndarray]:
-    """Count corrupted/dropped slices using QSIPrep/DSI Studio neighbor-slice difference heuristic.
-
-    Also returns a (T, Z) slice-intensity ratio matrix for diagnostic heatmap rendering.
-    """
+    """Count corrupted/dropped slices using QSIPrep/DSI Studio neighbor-slice difference heuristic."""
     n_vols = data_4d.shape[3]
     n_slices = data_4d.shape[slice_axis]
-    moved = np.moveaxis(data_4d, slice_axis, 0)  # (Z, A, B, T)
-    mask_m = np.moveaxis(brain_mask, slice_axis, 0)  # (Z, A, B)
+    moved = np.moveaxis(data_4d, slice_axis, 0)
+    mask_m = np.moveaxis(brain_mask, slice_axis, 0)
 
     slice_means = np.zeros((n_vols, n_slices), dtype=np.float64)
     valid_z = np.zeros(n_slices, dtype=bool)
@@ -81,7 +75,6 @@ def compute_bad_slices_qsiprep(
             valid_z[z] = True
             slice_means[:, z] = np.mean(moved[z][m_z], axis=0)
 
-    # Normalize each slice by median across high-b (or same-shell) volumes
     if bvals is not None and len(bvals) == n_vols:
         dw_mask = bvals > 150.0
         if not np.any(dw_mask):
@@ -107,8 +100,6 @@ def compute_bad_slices_qsiprep(
             ratio = s_curr / neighbor_avg
             ratio_map[v, z_curr] = float(ratio)
 
-            # DSI Studio / QSIPrep condition: |S_z - S_{z-1}| + |S_z - S_{z+1}| > 2 |S_{z+1} - S_{z-1}|
-            # combined with meaningful drop (< 0.78 of neighbor mean) so normal anatomy isn't false-flagged
             diff_curr = abs(s_curr - s_prev) + abs(s_curr - s_next)
             diff_neigh = abs(s_next - s_prev)
             if diff_curr > 2.2 * diff_neigh and ratio < 0.78:
@@ -123,10 +114,8 @@ def extract_diffusion_iqms(
     bvals: np.ndarray | None = None,
     bvecs: np.ndarray | None = None,
     slice_axis: int = 2,
-    metadata: dict[str, Any] | None = None,
 ) -> dict[str, float]:
-    """Extract QSIPrep desc-ImageQC_dwi + MRIQC-dMRI aligned IQMs."""
-    metadata = metadata or {}
+    """Extract QSIPrep desc-ImageQC_dwi + MRIQC-dMRI aligned IQMs strictly from the 4D DWI volume."""
     arr = np.nan_to_num(np.asarray(data_4d, dtype=np.float32), nan=0.0, posinf=0.0, neginf=0.0)
     if arr.ndim == 3:
         arr = arr[..., None]
@@ -146,7 +135,6 @@ def extract_diffusion_iqms(
     brain = priors.brain_mask
     bg = priors.bg_mask
 
-    # b=0 spatial IQMs
     bg_vals_b0 = b0_vol[bg] if int(bg.sum()) > 0 else np.array([0.0], dtype=np.float32)
     piesno_sigma = float(max(np.std(bg_vals_b0) * 1.5264, np.mean(bg_vals_b0) * 0.7979, _EPS))
     raw_b0_snr = float(np.mean(b0_vol[brain]) / piesno_sigma)
@@ -156,7 +144,6 @@ def extract_diffusion_iqms(
     gsr_y_b0 = compute_gsr(b0_vol, brain, axis=1)
     _, _, _, fwhm_avg_b0 = compute_fwhm(b0_vol, brain, zooms)
 
-    # High-b shell SNR
     if high_b_idx.size > 0:
         high_b_mean_vol = np.mean(arr[..., high_b_idx], axis=3)
         bg_high = high_b_mean_vol[bg] if int(bg.sum()) > 0 else bg_vals_b0
@@ -165,13 +152,11 @@ def extract_diffusion_iqms(
     else:
         snr_shell_high = raw_b0_snr
 
-    # QSIPrep NDC & bad slices
     raw_neighbor_corr = compute_neighbor_dwi_corr(arr, brain, bvals=bvals, bvecs=bvecs)
     raw_num_bad_slices, _ = compute_bad_slices_qsiprep(
         arr, brain, slice_axis=slice_axis, bvals=bvals
     )
 
-    # Coherence index proxy: angular signal consistency (1 - normalized variance across high-b directions)
     if high_b_idx.size >= 3:
         shell_ts = arr[brain][:, high_b_idx].astype(np.float64)
         mean_dw = np.mean(shell_ts, axis=1, keepdims=True) + _EPS
@@ -180,7 +165,6 @@ def extract_diffusion_iqms(
     else:
         raw_coherence_index = 1.0
 
-    # MRIQC-dMRI spikes_ppm (voxelwise spikes > 4.5 robust SD above per-voxel shell median)
     if high_b_idx.size >= 3:
         dw_ts = arr[brain][:, high_b_idx].astype(np.float64)
         med = np.median(dw_ts, axis=1, keepdims=True)
@@ -190,16 +174,10 @@ def extract_diffusion_iqms(
     else:
         spikes_ppm = 0.0
 
-    # Head motion (QSIPrep mean_fd, max_fd, max_rel_translation, max_rel_rotation)
-    if "gt_fd_timeseries" in metadata and len(metadata["gt_fd_timeseries"]) == n_vols:
-        fd_series = np.asarray(metadata["gt_fd_timeseries"], dtype=np.float32)
-    else:
-        fd_series = estimate_fd_proxy(arr, brain, zooms)
-
+    # Strictly image-derived motion proxy (never reads simulation metadata)
+    fd_series = estimate_fd_proxy(arr, brain, zooms)
     mean_fd = float(np.mean(fd_series))
     max_fd = float(np.max(fd_series))
-    max_rel_translation = float(metadata.get("gt_max_rel_translation", max_fd))
-    max_rel_rotation = float(metadata.get("gt_max_rel_rotation", 0.0))
 
     return {
         "raw_neighbor_corr": round(raw_neighbor_corr, 5),
@@ -215,8 +193,6 @@ def extract_diffusion_iqms(
         "fwhm_avg_b0": round(fwhm_avg_b0, 5),
         "mean_fd": round(mean_fd, 5),
         "max_fd": round(max_fd, 5),
-        "max_rel_translation": round(max_rel_translation, 5),
-        "max_rel_rotation": round(max_rel_rotation, 5),
         "raw_dimension_x": float(arr.shape[0]),
         "raw_dimension_y": float(arr.shape[1]),
         "raw_dimension_z": float(arr.shape[2]),

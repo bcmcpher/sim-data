@@ -1,8 +1,8 @@
-# `sim-data`: Multimodal MRI Artifact & Multi-Site QC Simulator
+# `sim-data`: Multimodal MRI Artifact & Multi-Site BIDS Simulator
 
-`sim-data` generates realistic, ground-truthed multimodal MRI quality-control datasets (**T1w, T2w, FLAIR, 4D BOLD fMRI, and 4D DWI**) from clean BIDS seed scans.
+`sim-data` generates **blinded, leakage-free multimodal MRI BIDS datasets** (**T1w, T2w, FLAIR, 4D BOLD fMRI, and 4D DWI**) with controlled scanner/site effects and acquisition artifacts from clean BIDS seed scans.
 
-It combines **MONAI**, **TorchIO**, and **custom MRI-physics operators** in a strict 7-stage causal acquisition order, extracts **NiPreps-aligned Image Quality Metrics (IQMs)** matching **MRIQC**, **fMRIPrep**, and **QSIPrep**, simulates **image-domain scanner/site effects** verifiable via **ComBat** and **CovBat**, and outputs **`qc-studio`-compatible visual-QC packets** (`packet.json` v1.1 + midline and enhanced diagnostic views).
+It combines **MONAI**, **TorchIO**, and **custom MRI-physics operators** in a strict 7-stage causal acquisition order, records all injected artifact and site weights exclusively in a ground-truth **`manifest.tsv`** (keeping filenames and JSON sidecars completely clean for unbiased manual and AI evaluations), and provides decoupled post-hoc tools for **blind NiPreps-aligned IQM extraction** (MRIQC, fMRIPrep, QSIPrep) and **ComBat / CovBat multi-site harmonization auditing**.
 
 ---
 
@@ -30,7 +30,7 @@ uv sync --extra cu128 --extra harmonization --group dev
 
 ## Input BIDS Structure
 
-Provide a clean baseline BIDS dataset containing any subset of the supported modalities (`T1w`, `T2w`, `FLAIR`, `bold`, `dwi`):
+Provide a clean baseline BIDS dataset containing any subset of the supported modalities (`T1w`, `T2w`, `FLAIR`, `bold`, `dwi`). Existing `ses-*` sessions are preserved untouched:
 
 ```text
 my_bids/
@@ -38,7 +38,7 @@ my_bids/
 └── sub-01/
     ├── anat/
     │   ├── sub-01_T1w.nii.gz
-    │   ├── sub-01_T1w.json          # Optional: PhaseEncodingDirection, SliceEncodingDirection
+    │   ├── sub-01_T1w.json          # Recommended: PhaseEncodingDirection, SliceEncodingDirection
     │   ├── sub-01_T2w.nii.gz
     │   └── sub-01_FLAIR.nii.gz
     ├── func/
@@ -51,7 +51,10 @@ my_bids/
         └── sub-01_dwi.bvec
 ```
 
-- Volumes are canonicalized internally to **RAS+**, and encoding axes are resolved from BIDS JSON sidecars (`PhaseEncodingDirection`, `SliceEncodingDirection`) with standard modality fallbacks.
+- **Zero-leakage blinded output**: Output filenames use shuffled sequential `run-01`, `run-02`, ... indices with **no recipe, artifact, or severity names**, and `.json` sidecars contain **no simulation provenance**.
+- **Multi-site isolation (`output.site_naming`)**:
+  - `desc` (default for multi-site): `sub-01[_ses-01][_task-rest]_run-01_desc-<Site>_<modality>.nii.gz`
+  - `none` (strict raw-BIDS compliant): `sub-01[_ses-01][_task-rest]_run-01_<modality>.nii.gz` (site recorded in `participants.tsv`, `*_scans.tsv`, and `manifest.tsv`)
 - **DWI motion & `.bvec` behavior**: By default (`rotate_dwi_bvecs: false`), simulated inter-volume DWI motion leaves `.bvec` files **unrotated**, mirroring raw scanner acquisitions. Set `sampling.rotate_dwi_bvecs: true` when simulating motion-corrected/preprocessed datasets.
 
 ---
@@ -59,44 +62,50 @@ my_bids/
 ## Quickstart (CLI)
 
 ### 1. (Optional) Generate an Offline Synthetic Multimodal BIDS Cohort
-For smoke tests, CI, or experimenting without real scans:
 ```bash
 uv run --no-sync sim-data init-phantom --out ./demo_bids --n-subjects 4
 ```
 
-### 2. Simulate Artifacts, Multi-Site Effects, IQMs & Visual-QC Packets
+### 2. Generate Blinded Simulated BIDS Files + Ground-Truth `manifest.tsv`
 ```bash
 uv run --no-sync sim-data generate \
   --bids-dir ./demo_bids \
   --config configs/default_multimodal.yaml \
   --out-dir ./demo_out \
+  --manifest-out ./demo_manifest.tsv \
   --workers 4 \
   --device auto
 ```
-- Use `--device auto` (uses CUDA on RTX 5080, CPU otherwise), `--device cpu`, or `--device cuda`.
-- Included YAML templates in [`configs/`](configs/):
-  - `configs/default_multimodal.yaml`: Multi-site factorial (`multisite_factorial`) across all 5 modalities and 3 scanner profiles.
-  - `configs/dose_response_structural.yaml`: Single-artifact severity sweep (`dose_response`) across all 11 structural artifacts.
-  - `configs/sites_catalog.yaml`: Reusable catalog of 4 image-domain scanner physics profiles (`Siemens_3T_32ch`, `GE_15T_8ch`, `Philips_3T_16ch`, `Siemens_3T_64ch_HighAccel`).
+- By default (`extract_iqms: false`, `render_views: false`, `write_packets: false`), `generate` writes **only** the blinded BIDS dataset (`sub-*/`, `dataset_description.json`, `participants.tsv`, `*_scans.tsv`, `.bidsignore`) and the official ground-truth **`manifest.tsv`** (recording all injected artifact weights `sev_*`, realized physical parameters, site physics parameters, and continuous `defect_burden`).
+- Pass `--manifest-out` to save the ground-truth answer key completely outside the BIDS directory for blinded manual or AI evaluations (defaults to `<out-dir>/manifest.tsv`, ignored by `.bidsignore`).
 
-### 3. Verify ComBat vs. CovBat Multi-Site Harmonization
+### 3. Independently Extract Blind NiPreps IQMs (or Run Real MRIQC / fMRIPrep / QSIPrep)
+```bash
+uv run --no-sync sim-data extract-iqms \
+  --bids-dir ./demo_out \
+  --out ./demo_iqms.tsv \
+  --workers 4
+```
+Quantifies MRIQC / fMRIPrep / QSIPrep-aligned IQMs **strictly from the modified NIfTI images on disk** with zero access to clean baselines or simulation metadata.
+
+### 4. Audit ComBat vs. CovBat Multi-Site Harmonization
 ```bash
 uv run --no-sync sim-data verify-harmonization \
-  --manifest ./demo_out/manifest.parquet \
-  --out-dir ./demo_out/harmonization_audit \
+  --manifest ./demo_manifest.tsv \
+  --iqms ./demo_iqms.tsv \
+  --out-dir ./demo_harmonization_audit \
   --modality T1w
 ```
-Audits Raw vs. ComBat vs. CovBat across ANOVA $F$/$\eta^2$ (location), Levene variance (scale), within-site residual covariance Frobenius distance, off-diagonal correlation Frobenius distance, linear & RF site-classifier AUC, and QC classification preservation, plus saves `site_pca_comparison.png`.
+Works with both `sim-data extract-iqms` TSVs and external **MRIQC / QSIPrep** group TSVs (joined via `scan_id` or `bids_name`). Outputs `harmonization_report.json`, `iqms_combat.tsv`, `iqms_covbat.tsv`, and `site_pca_comparison.png`.
 
-### 4. Benchmark Deterministic IQM Baseline & Enrich Visual-QC Packets
+### 5. (Optional) Benchmark Deterministic IQM Baseline
 ```bash
 uv run --no-sync sim-data benchmark-deterministic \
-  --manifest ./demo_out/manifest.parquet \
-  --out-dir ./demo_out/qc_benchmark \
-  --modality T1w \
-  --update-packets ./demo_out
+  --manifest ./demo_manifest.tsv \
+  --iqms ./demo_iqms.tsv \
+  --out-dir ./demo_qc_benchmark \
+  --modality T1w
 ```
-Fits stratified cross-validated regularized Logistic Regression over NiPreps IQMs (`pass`/`borderline`/`fail`), reports Macro-F1, Cohen's $\kappa$, quadratic weighted $\kappa$, and per-artifact detection recall (highlighting deterministic blind spots), and optionally writes `deterministic_priors` into each scan's `packet.json`.
 
 ---
 
@@ -130,46 +139,21 @@ All artifacts map normalized severity $s \in [0, 1]$ monotonically to physical p
 
 ```text
 demo_out/
+├── dataset_description.json          # BIDS dataset metadata
+├── participants.tsv                  # Subject IDs & site mapping
+├── .bidsignore                       # Ignores non-BIDS bookkeeping files
 ├── simulation_config_resolved.yaml
-├── manifest.parquet                  # Unified metadata, artifact severities, fidelity & NiPreps IQMs
-├── manifest.tsv
-├── sub-01/                           # BIDS-derivative simulated NIfTI + JSON provenance (+ .bval/.bvec)
-│   ├── anat/
-│   ├── func/
-│   └── dwi/
-├── views/
-│   ├── *_mid_{sag,ax,cor}.png        # qc-studio prototype-compatible 3 midline slices
-│   ├── *_ortho.png                   # 3-plane x 5-slice orthogonal mosaic
-│   ├── *_bg_boost.png                # Log/gamma-boosted background artifact view
-│   ├── *_fmri_carpet.png             # fMRIPrep-style BOLD carpet plot + FD/stdDVARS + tSNR
-│   └── *_dwi_summary.png             # QSIPrep-style b=0 vs high-b + Volume x Slice dropout heatmap
-└── packets/
-    └── *_packet.json                 # Visual-QC payload v1.1 (IQMs + midline/enhanced views + ground_truth)
+├── manifest.tsv                      # Official ground-truth ledger (or saved via --manifest-out)
+└── sub-01/
+    ├── sub-01_scans.tsv              # Clean BIDS scans table (filename + site_id only)
+    ├── anat/
+    │   ├── sub-01_run-01_desc-Siemens3T32ch_T1w.nii.gz
+    │   └── sub-01_run-01_desc-Siemens3T32ch_T1w.json   # Clean sidecar (zero simulation provenance)
+    ├── func/
+    └── dwi/
 ```
 
----
-
-## Python API Example
-
-```python
-from sim_data.config import SimulationConfig
-from sim_data.harmonization import run_harmonization_audit
-from sim_data.pipeline import run_simulation_plan
-import pandas as pd
-
-cfg = SimulationConfig.from_yaml("configs/default_multimodal.yaml")
-result = run_simulation_plan(
-    bids_dir="./demo_bids",
-    config=cfg,
-    out_dir="./demo_out",
-    workers=4,
-    device="auto",
-)
-
-df = pd.read_parquet(result.manifest_paths["parquet"])
-audit = run_harmonization_audit(df, out_dir="./demo_out/harmonization_audit", modality="T1w")
-print(audit.report["deltas"])
-```
+*(Setting `render_views: true` and `write_packets: true` optionally adds `views/` with 3 midline slices + enhanced mosaics/carpet/DWI summaries and `packets/*_packet.json`.)*
 
 ---
 

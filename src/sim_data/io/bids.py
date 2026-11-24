@@ -1,4 +1,4 @@
-"""BIDS input discovery and BIDS-derivative writing for multimodal MRI."""
+"""BIDS input discovery and zero-leakage blinded BIDS writing for multimodal MRI."""
 
 from __future__ import annotations
 
@@ -10,8 +10,9 @@ from typing import Any
 
 import nibabel as nib
 import numpy as np
+import pandas as pd
 
-from sim_data.config import Modality
+from sim_data.config import Modality, SiteNaming
 
 _MODALITY_FOLDERS: dict[str, str] = {
     "T1w": "anat",
@@ -21,7 +22,7 @@ _MODALITY_FOLDERS: dict[str, str] = {
     "dwi": "dwi",
 }
 
-_ENTITY_RE = re.compile(r"(sub|ses|task|acq|run|dir|echo)-([A-Za-z0-9]+)")
+_ENTITY_RE = re.compile(r"(sub|ses|task|acq|run|dir|echo|desc)-([A-Za-z0-9]+)")
 
 
 @dataclass
@@ -92,7 +93,6 @@ def discover_bids_scans(
     for path in sorted(root.rglob("*.nii*")):
         if not (path.name.endswith(".nii.gz") or path.name.endswith(".nii")):
             continue
-        # Skip derivatives folder if scanning a BIDS root containing derivatives
         rel_parts = path.relative_to(root).parts
         if "derivatives" in rel_parts:
             continue
@@ -159,12 +159,18 @@ def _sanitize_entity(value: str) -> str:
     return re.sub(r"[^A-Za-z0-9]", "", value)
 
 
-def build_derivative_stem(
+def build_blinded_bids_stem(
     scan: BIDSScan,
-    recipe_id: str,
-    site_id: str,
+    run_index: int,
+    site_id: str | None = None,
+    site_naming: SiteNaming = "desc",
 ) -> tuple[Path, str]:
-    """Construct relative BIDS-derivative directory and filename stem."""
+    """Construct a zero-leakage blinded BIDS relative directory and filename stem.
+
+    Preserves input `ses-*` and `task-*` entities untouched, assigns an opaque sequential
+    `run-XX` index, and optionally isolates site identity via `desc-<site>` when
+    `site_naming == "desc"`. Never writes recipe, artifact, or severity labels into filenames.
+    """
     sub_dir = Path(f"sub-{scan.subject}")
     if scan.session:
         sub_dir = sub_dir / f"ses-{scan.session}"
@@ -175,28 +181,36 @@ def build_derivative_stem(
         parts.append(f"ses-{scan.session}")
     if "task" in scan.entities:
         parts.append(f"task-{scan.entities['task']}")
-    parts.append(f"acq-{_sanitize_entity(recipe_id)}{_sanitize_entity(site_id)}")
-    if "run" in scan.entities:
-        parts.append(f"run-{scan.entities['run']}")
+    parts.append(f"run-{run_index:02d}")
+    if site_naming == "desc" and site_id:
+        sanitized_site = _sanitize_entity(site_id)
+        if sanitized_site:
+            parts.append(f"desc-{sanitized_site}")
     parts.append(scan.modality)
     return rel_dir, "_".join(parts)
 
 
-def write_bids_derivative(
+def write_bids_scan(
     out_dir: str | Path,
     scan: BIDSScan,
-    recipe_id: str,
-    site_id: str,
+    run_index: int,
+    site_id: str | None,
+    site_naming: SiteNaming,
     data: np.ndarray,
     affine: np.ndarray,
     sidecar: dict[str, Any],
-    provenance: dict[str, Any],
     bvals: np.ndarray | None = None,
     bvecs: np.ndarray | None = None,
 ) -> dict[str, Path]:
-    """Write simulated NIfTI, JSON sidecar with provenance, and optional .bval/.bvec."""
+    """Write a blinded simulated BIDS NIfTI, clean zero-leakage JSON sidecar, and DWI tables.
+
+    Strips any SimulationProvenance metadata so no artifact or ground-truth information
+    leaks into the image sidecar during manual or AI visual-QC evaluation.
+    """
     out_root = Path(out_dir)
-    rel_dir, stem = build_derivative_stem(scan, recipe_id=recipe_id, site_id=site_id)
+    rel_dir, stem = build_blinded_bids_stem(
+        scan, run_index=run_index, site_id=site_id, site_naming=site_naming
+    )
     target_dir = out_root / rel_dir
     target_dir.mkdir(parents=True, exist_ok=True)
 
@@ -206,9 +220,9 @@ def write_bids_derivative(
     out_img = nib.Nifti1Image(np.asarray(data, dtype=np.float32), affine)
     nib.save(out_img, str(nifti_out))
 
-    merged_sidecar = dict(sidecar)
-    merged_sidecar["SimulationProvenance"] = provenance
-    json_out.write_text(json.dumps(merged_sidecar, indent=2), encoding="utf-8")
+    # Write clean BIDS sidecar with zero simulation/artifact leakage
+    clean_sidecar = {k: v for k, v in sidecar.items() if k != "SimulationProvenance"}
+    json_out.write_text(json.dumps(clean_sidecar, indent=2), encoding="utf-8")
 
     written: dict[str, Path] = {"nifti": nifti_out, "json": json_out}
 
@@ -228,5 +242,92 @@ def write_bids_derivative(
         lines = [" ".join(f"{float(v):.6f}" for v in row) for row in arr]
         bvec_out.write_text("\n".join(lines) + "\n", encoding="utf-8")
         written["bvec"] = bvec_out
+
+    return written
+
+
+def write_bids_root_files(
+    out_dir: str | Path,
+    rows: list[dict[str, Any]],
+    site_naming: SiteNaming = "desc",
+) -> dict[str, Path]:
+    """Write standard BIDS root files: dataset_description.json, participants.tsv, *_scans.tsv, .bidsignore."""
+    out_root = Path(out_dir)
+    out_root.mkdir(parents=True, exist_ok=True)
+    written: dict[str, Path] = {}
+
+    is_derivative = site_naming == "desc"
+    desc: dict[str, Any] = {
+        "Name": "Simulated Multimodal MRI Dataset",
+        "BIDSVersion": "1.9.0",
+        "DatasetType": "derivative" if is_derivative else "raw",
+    }
+    if is_derivative:
+        desc["GeneratedBy"] = [{"Name": "sim-data", "Version": "0.1.0"}]
+    desc_path = out_root / "dataset_description.json"
+    desc_path.write_text(json.dumps(desc, indent=2), encoding="utf-8")
+    written["dataset_description"] = desc_path
+
+    # Build participants.tsv with site_id when a subject maps to a single site (else comma-joined sites)
+    sub_sites: dict[str, set[str]] = {}
+    for row in rows:
+        sub = str(row["subject"])
+        site = str(row.get("site_id", ""))
+        sub_sites.setdefault(sub, set())
+        if site:
+            sub_sites[sub].add(site)
+
+    part_rows = []
+    for sub in sorted(sub_sites):
+        sites_sorted = sorted(sub_sites[sub])
+        part_rows.append(
+            {
+                "participant_id": f"sub-{sub}",
+                "site_id": sites_sorted[0] if len(sites_sorted) == 1 else ",".join(sites_sorted),
+            }
+        )
+    part_path = out_root / "participants.tsv"
+    pd.DataFrame(part_rows).to_csv(part_path, sep="\t", index=False)
+    written["participants"] = part_path
+
+    # Per-subject/session BIDS *_scans.tsv listing only filename and site_id (zero artifact leakage)
+    scans_grouped: dict[tuple[str, str], list[dict[str, str]]] = {}
+    for row in rows:
+        nifti_rel = str(row.get("nifti_path", ""))
+        if not nifti_rel:
+            continue
+        sub = str(row["subject"])
+        ses = str(row.get("session", ""))
+        sub_root = f"sub-{sub}/ses-{ses}/" if ses else f"sub-{sub}/"
+        rel_inside = nifti_rel[len(sub_root) :] if nifti_rel.startswith(sub_root) else nifti_rel
+        scans_grouped.setdefault((sub, ses), []).append(
+            {"filename": rel_inside, "site_id": str(row.get("site_id", ""))}
+        )
+
+    for (sub, ses), scan_entries in sorted(scans_grouped.items()):
+        target_dir = out_root / f"sub-{sub}" / f"ses-{ses}" if ses else out_root / f"sub-{sub}"
+        target_dir.mkdir(parents=True, exist_ok=True)
+        fname = f"sub-{sub}_ses-{ses}_scans.tsv" if ses else f"sub-{sub}_scans.tsv"
+        scan_entries_sorted = sorted(scan_entries, key=lambda d: d["filename"])
+        pd.DataFrame(scan_entries_sorted).to_csv(target_dir / fname, sep="\t", index=False)
+
+    # .bidsignore so BIDS validators & NiPreps tools ignore bookkeeping/evaluation files
+    bidsignore_path = out_root / ".bidsignore"
+    bidsignore_path.write_text(
+        "\n".join(
+            [
+                "manifest.tsv",
+                "iqms.tsv",
+                "simulation_config_resolved.yaml",
+                "views/",
+                "packets/",
+                "harmonization_audit/",
+                "qc_benchmark/",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    written["bidsignore"] = bidsignore_path
 
     return written

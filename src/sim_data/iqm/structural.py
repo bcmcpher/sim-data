@@ -1,11 +1,15 @@
-"""MRIQC-aligned structural IQMs (T1w, T2w, FLAIR) + supplemental blind-spot metrics."""
+"""Strictly blind MRIQC-aligned structural IQMs (T1w, T2w, FLAIR) + supplemental metrics.
+
+Every metric is quantified solely from the modified 3D NIfTI volume with zero access
+to clean baselines or simulation metadata.
+"""
 
 from __future__ import annotations
 
 import numpy as np
 from scipy import ndimage, stats
 
-from sim_data.io.orientation import AnatomicalPriors, compute_anatomical_priors
+from sim_data.io.orientation import compute_anatomical_priors
 
 _EPS = 1e-6
 
@@ -24,7 +28,6 @@ def compute_efc(vol: np.ndarray) -> float:
     n_vox = float(v.size)
     entropy = -float(np.sum(nonzero * np.log(nonzero)))
     max_entropy = float(np.sqrt(n_vox) * np.log(np.sqrt(n_vox))) if n_vox > 1 else 1.0
-    # Normalize to [0, 1] scale matching MRIQC's normalized EFC convention
     return float(entropy / max(max_entropy, _EPS))
 
 
@@ -72,7 +75,6 @@ def compute_qi1_qi2(bg_vals: np.ndarray) -> tuple[float, float]:
     if pos.size < 16:
         return (0.0, 0.0)
 
-    # Estimate noise mode via histogram on lower 95% of positive background
     p95 = float(np.percentile(pos, 95.0))
     if p95 <= _EPS:
         return (0.0, 0.0)
@@ -80,12 +82,10 @@ def compute_qi1_qi2(bg_vals: np.ndarray) -> tuple[float, float]:
     mode_idx = int(np.argmax(hist))
     mode_val = 0.5 * (edges[mode_idx] + edges[mode_idx + 1])
 
-    # QI1: fraction of background voxels far above symmetric noise tail (artifactual background)
     mad = float(np.median(np.abs(pos - mode_val))) + _EPS
     thresh = mode_val + 4.5 * 1.4826 * mad
     qi1 = float(np.mean(bg > thresh))
 
-    # QI2: goodness-of-fit L1 residual between empirical clean background PDF and fitted Rayleigh/chi
     clean = pos[pos <= thresh]
     if clean.size < 32 or float(np.std(clean)) <= _EPS:
         return (qi1, 0.0)
@@ -104,7 +104,6 @@ def compute_inu_proxy(vol: np.ndarray, brain_mask: np.ndarray) -> tuple[float, f
     med = float(np.median(fg))
     if med <= _EPS or int(brain_mask.sum()) < 64:
         return (1.0, 0.0)
-    # Estimate smooth multiplicative envelope via normalized convolution
     sigma = tuple(max(3.0, s / 8.0) for s in vol.shape)
     num = ndimage.gaussian_filter(vol * brain_mask.astype(np.float32), sigma=sigma, mode="constant")
     den = ndimage.gaussian_filter(brain_mask.astype(np.float32), sigma=sigma, mode="constant")
@@ -132,9 +131,8 @@ def compute_gsr(vol: np.ndarray, brain_mask: np.ndarray, axis: int) -> float:
 def extract_structural_iqms(
     vol: np.ndarray,
     zooms: tuple[float, float, float],
-    clean_priors: AnatomicalPriors | None = None,
 ) -> dict[str, float]:
-    """Extract MRIQC-aligned structural IQMs + supplemental blind-spot metrics from a 3D volume."""
+    """Extract MRIQC-aligned structural IQMs strictly from a single 3D volume."""
     v = np.nan_to_num(np.asarray(vol, dtype=np.float32), nan=0.0, posinf=0.0, neginf=0.0)
     priors = compute_anatomical_priors(v)
 
@@ -161,64 +159,44 @@ def extract_structural_iqms(
     gm_mean = float(np.mean(gm_vals))
     gm_std = float(np.std(gm_vals))
 
-    # MRIQC SNR variants
     snr_total = float(fg_mean / (fg_std + _EPS))
     snr_wm = float(wm_mean / (wm_std + _EPS))
     snr_gm = float(gm_mean / (gm_std + _EPS))
-    # Dietrich SNR (background Rayleigh correction factor sqrt(2 / (4 - pi)) ~ 1.526)
     bg_sigma_dietrich = max(bg_std * 1.5264, bg_mean * 0.7979, _EPS)
     snrd_total = float(fg_mean / bg_sigma_dietrich)
 
-    # CNR & CJV (Ganzetti et al.)
     tissue_diff = abs(wm_mean - gm_mean)
     cnr = float(tissue_diff / np.sqrt(wm_std**2 + gm_std**2 + bg_std**2 + _EPS))
     cjv = float((wm_std + gm_std) / (tissue_diff + _EPS))
 
-    # WM2Max
     p995 = float(np.percentile(v[v > 0], 99.5)) if np.any(v > 0) else 1.0
     wm2max = float(wm_med / (p995 + _EPS))
 
-    # EFC & FBER
     efc = compute_efc(v)
     fg_energy = float(np.mean(fg_vals.astype(np.float64) ** 2))
     bg_energy = float(np.mean(bg_vals.astype(np.float64) ** 2))
     fber = float(min(fg_energy / (bg_energy + 1e-4), 1e5))
 
-    # Mortamet QI1 & QI2
     qi1, qi2 = compute_qi1_qi2(bg_vals)
-
-    # INU proxy & FWHM
     inu_med, inu_range = compute_inu_proxy(v, brain)
     fwhm_x, fwhm_y, fwhm_z, fwhm_avg = compute_fwhm(v, brain, zooms)
 
-    # Supplemental blind-spot metrics:
-    # 1. Edge clipping fraction (fraction of foreground voxels touching any of the 6 FOV boundary planes)
+    # Blind supplemental metrics computed purely from the modified image:
+    # 1. Edge clipping fraction (brain touching FOV faces)
     border = np.zeros_like(brain, dtype=bool)
     border[0, :, :] = border[-1, :, :] = True
     border[:, 0, :] = border[:, -1, :] = True
     border[:, :, 0] = border[:, :, -1] = True
-    # Also detect sharp interior slab zero-cuts by checking sharp zero-plane transitions near clean bbox
     edge_touch = float(np.sum(brain & border) / max(1, int(np.sum(brain))))
 
-    # 2. Anterior-inferior zero ratio (detects post-noise defacing cuts!)
-    bmin = clean_priors.bbox_min if (clean_priors is not None and clean_priors.brain_mask.shape == v.shape) else priors.bbox_min
-    bmax = clean_priors.bbox_max if (clean_priors is not None and clean_priors.brain_mask.shape == v.shape) else priors.bbox_max
-    y_mid = int(bmin[1] + 0.65 * (bmax[1] - bmin[1]))
-    z_mid = int(bmin[2] + 0.55 * (bmax[2] - bmin[2]))
-    ant_inf_ref = (
-        clean_priors.brain_mask
-        if (clean_priors is not None and clean_priors.brain_mask.shape == v.shape)
-        else brain
-    )
-    ant_inf_roi = np.zeros_like(brain, dtype=bool)
-    ant_inf_roi[:, y_mid : bmax[1] + 1, bmin[2] : z_mid + 1] = True
-    ant_inf_brain = ant_inf_ref & ant_inf_roi
-    if int(ant_inf_brain.sum()) > 16:
-        ant_inf_zero = float(np.mean(v[ant_inf_brain] <= 1e-5))
-    else:
-        ant_inf_zero = 0.0
+    # 2. Exact-zero voxel fraction in anterior-inferior quadrant of the image (post-noise defacing detector)
+    # Normal magnitude MRI has nonzero Rician background noise; post-noise defacing/slab-clipping leaves exact 0.0
+    y_start = int(v.shape[1] * 0.55)
+    z_end = int(v.shape[2] * 0.60)
+    ant_inf_slab = v[:, y_start:, :z_end]
+    ant_inf_zero = float(np.mean(ant_inf_slab <= 1e-6)) if ant_inf_slab.size > 0 else 0.0
 
-    # 3. High-frequency energy ratio & k-space spike ratio (catches RF spikes, Gibbs, noise)
+    # 3. High-frequency energy ratio & k-space spike ratio
     k_mag = np.abs(np.fft.fftshift(np.fft.fftn(v.astype(np.float32))))
     kx, ky, kz = np.meshgrid(
         np.linspace(-1.0, 1.0, v.shape[0], dtype=np.float32),

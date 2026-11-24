@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
 
 import matplotlib
 
@@ -105,20 +104,15 @@ def _render_ortho_grid(vol: np.ndarray, bg_boost: bool, path: Path, n_slices: in
 def _render_fmri_carpet_summary(
     data_4d: np.ndarray,
     zooms: tuple[float, float, float],
-    metadata: dict[str, Any],
     path: Path,
 ) -> None:
-    """Render fMRIPrep-inspired BOLD summary: FD + std_dvars traces, carpet plot, and tSNR slice."""
+    """Render fMRIPrep-inspired BOLD summary: blind FD + std_dvars traces, carpet plot, and tSNR slice."""
     mean_vol = np.mean(data_4d, axis=3)
     priors = compute_anatomical_priors(mean_vol)
     brain = priors.brain_mask
-    n_t = data_4d.shape[3]
 
     _, dvars_std, _ = compute_dvars_series(data_4d, brain)
-    if "gt_fd_timeseries" in metadata and len(metadata["gt_fd_timeseries"]) == n_t:
-        fd = np.asarray(metadata["gt_fd_timeseries"], dtype=np.float32)
-    else:
-        fd = estimate_fd_proxy(data_4d, brain, zooms)
+    fd = estimate_fd_proxy(data_4d, brain, zooms)
 
     ts = data_4d[brain].astype(np.float32)  # (V, T)
     # Sample up to 600 voxels sorted by mean intensity (tissue proxy grouping: CSF/GM/WM)
@@ -224,7 +218,6 @@ def render_scan_views(
     render_enhanced: bool = True,
     bvals: np.ndarray | None = None,
     slice_axis: int = 2,
-    metadata: dict[str, Any] | None = None,
 ) -> dict[str, dict[str, str]]:
     """Render qc-studio midline 3-plane slices and enhanced diagnostic mosaics.
 
@@ -277,7 +270,7 @@ def render_scan_views(
         }
         if modality == "bold" and data.ndim == 4 and data.shape[3] >= 3:
             carpet_p = views_dir / f"{scan_id}_fmri_carpet.{ext}"
-            _render_fmri_carpet_summary(data, zooms=zooms, metadata=metadata or {}, path=carpet_p)
+            _render_fmri_carpet_summary(data, zooms=zooms, path=carpet_p)
             views_out["enhanced"]["fmri_carpet_summary"] = str(carpet_p.relative_to(out_root))
         elif modality == "dwi" and data.ndim == 4 and data.shape[3] >= 2:
             dwi_p = views_dir / f"{scan_id}_dwi_summary.{ext}"
