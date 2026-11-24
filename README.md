@@ -61,10 +61,18 @@ my_bids/
 
 ## Quickstart (CLI)
 
-### 1. (Optional) Generate an Offline Synthetic Multimodal BIDS Cohort
+### 1. (Optional) Synthesize a Clean Multimodal Cohort from 3–5+ Structural Seeds
+If you only have clean structural scans (`T1w`, optionally paired with `T2w`), you can expand **3–5+ seed subjects** into $N$ anatomically distinct, cross-modality-aligned subjects (`T1w`, `T2w`, `FLAIR`, 4D `bold`, 4D `dwi`) via coherent diffeomorphic warps—template-free by default, with optional PVE / RSN / DTI templates supported:
 ```bash
-uv run --no-sync sim-data init-phantom --out ./demo_bids --n-subjects 4
+uv run --no-sync sim-data synthesize-cohort \
+  --seed-bids ./clean_structural_seeds \
+  --out ./synthetic_clean_cohort \
+  --config configs/synthesize_cohort.yaml \
+  --n-subjects 12 \
+  --workers 4 \
+  --device auto
 ```
+*(Or create a quick offline synthetic phantom cohort for smoke tests via `uv run --no-sync sim-data init-phantom --out ./demo_bids --n-subjects 4`.)*
 
 ### 2. Generate Blinded Simulated BIDS Files + Ground-Truth `manifest.tsv`
 ```bash

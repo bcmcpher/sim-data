@@ -1,0 +1,45 @@
+global_seed: 1024
+n_subjects: 12
+min_seed_subjects: 3
+allow_few_seeds: false
+modalities: ["T1w", "T2w", "FLAIR", "bold", "dwi"]
+
+warp:
+  strength: 0.5
+  smooth_sigma_mm: 16.0
+  affine_scale_range: [0.94, 1.06]
+  affine_rot_deg: 6.0
+  affine_shear: 0.03
+  flip_lr_prob: 0.5
+
+# All templates are optional (null = template-free physics synthesis)
+templates:
+  tissue_pve_nifti: null        # Optional 4D (X,Y,Z,3|4) CSF/GM/WM[/Scalp] PVE NIfTI
+  rsn_parcellation_nifti: null  # Optional 3D integer parcellation or 4D RSN maps for BOLD
+  dti_eigenvector_nifti: null   # Optional 4D (X,Y,Z,3) primary fiber vecs or (X,Y,Z,6) DTI tensor
+
+structural:
+  preserve_seed_texture_weight: 0.65
+  tissue_param_jitter: 0.06
+  baseline_snr: 80.0
+
+bold:
+  voxel_size_mm: [3.0, 3.0, 3.0]
+  n_trs: 60
+  tr_sec: 2.0
+  te_sec: 0.030
+  gm_bold_pct: 0.025
+  physio_pct: 0.015
+  ar1_phi: 0.35
+  baseline_snr: 65.0
+
+dwi:
+  voxel_size_mm: [2.5, 2.5, 2.5]
+  n_b0: 3
+  shells:
+    - [1000.0, 20]
+    - [2000.0, 20]
+  crossing_fiber_fraction: 0.30
+  tr_sec: 4.2
+  te_sec: 0.089
+  baseline_snr: 55.0

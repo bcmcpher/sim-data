@@ -10,12 +10,13 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
-from sim_data.config import Modality, SimulationConfig
+from sim_data.config import CohortSynthesisConfig, Modality, SimulationConfig
 from sim_data.eval.deterministic_qc import evaluate_deterministic_qc
 from sim_data.harmonization.audit import run_harmonization_audit
 from sim_data.iqm.extractor import extract_iqms_for_bids_dir
 from sim_data.phantoms.synthetic import generate_synthetic_bids_cohort
 from sim_data.pipeline.engine import run_simulation_plan
+from sim_data.synthesis.cohort import synthesize_cohort
 
 app = typer.Typer(
     name="sim-data",
@@ -40,6 +41,64 @@ def init_phantom(
     """Create an offline synthetic multimodal BIDS dataset (T1w, T2w, FLAIR, bold, dwi)."""
     root = generate_synthetic_bids_cohort(out_dir=out, n_subjects=n_subjects, seed=seed)
     console.print(f"[green]Created synthetic BIDS cohort ({n_subjects} subjects) at:[/green] {root}")
+
+
+@app.command("synthesize-cohort")
+def synthesize_cohort_cmd(
+    seed_bids: Path = typer.Option(
+        ..., "--seed-bids", exists=True, help="Clean structural seed BIDS directory (3-5+ subjects recommended)."
+    ),
+    out: Path = typer.Option(..., "--out", help="Output clean synthesized multimodal BIDS directory."),
+    config: Optional[Path] = typer.Option(
+        None, "--config", exists=True, help="Optional YAML synthesis config (defaults to CohortSynthesisConfig)."
+    ),
+    n_subjects: Optional[int] = typer.Option(
+        None, "--n-subjects", min=1, help="Override number of synthetic subjects to generate."
+    ),
+    warp_strength: Optional[float] = typer.Option(
+        None, "--warp-strength", min=0.0, max=1.0, help="Override diffeomorphic warp strength [0..1]."
+    ),
+    allow_few_seeds: bool = typer.Option(
+        False, "--allow-few-seeds", help="Allow running with fewer than min_seed_subjects (default 3)."
+    ),
+    tissue_pve: Optional[Path] = typer.Option(
+        None, "--tissue-pve", exists=True, help="Optional 4D CSF/GM/WM[/Scalp] PVE template NIfTI."
+    ),
+    rsn_template: Optional[Path] = typer.Option(
+        None, "--rsn-template", exists=True, help="Optional 3D/4D RSN parcellation NIfTI for BOLD."
+    ),
+    dti_template: Optional[Path] = typer.Option(
+        None, "--dti-template", exists=True, help="Optional 4D eigenvector/tensor NIfTI for DWI."
+    ),
+    workers: int = typer.Option(1, "--workers", min=1, help="Parallel worker processes."),
+    device: str = typer.Option("auto", "--device", help="PyTorch compute device: auto, cpu, or cuda."),
+) -> None:
+    """Expand 3-5+ clean structural BIDS seeds into N distinct, co-registered multimodal subjects."""
+    cfg = CohortSynthesisConfig.from_yaml(config) if config is not None else CohortSynthesisConfig()
+    if n_subjects is not None:
+        cfg.n_subjects = n_subjects
+    if warp_strength is not None:
+        cfg.warp.strength = warp_strength
+    if allow_few_seeds:
+        cfg.allow_few_seeds = True
+    if tissue_pve is not None:
+        cfg.templates.tissue_pve_nifti = tissue_pve
+    if rsn_template is not None:
+        cfg.templates.rsn_parcellation_nifti = rsn_template
+    if dti_template is not None:
+        cfg.templates.dti_eigenvector_nifti = dti_template
+
+    res = synthesize_cohort(
+        seed_bids_dir=seed_bids,
+        config=cfg,
+        out_dir=out,
+        workers=workers,
+        device=device,
+    )
+    console.print(
+        f"[green]Synthesized {res.n_subjects} multimodal subjects from {res.n_seed_subjects} seed(s) in:[/green] {res.out_dir}"
+    )
+    console.print(f"  synthesis manifest: {res.manifest_path}")
 
 
 @app.command("generate")
