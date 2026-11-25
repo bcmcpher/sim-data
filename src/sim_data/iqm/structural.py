@@ -112,7 +112,7 @@ def compute_inu_n4(vol: np.ndarray, brain_mask: np.ndarray) -> tuple[float, floa
         sitk_img = sitk.GetImageFromArray(v_pos)
         sitk_mask = sitk.GetImageFromArray(brain_mask.astype(np.uint8))
 
-        shrink_factor = max(1, min(3, min(vol.shape) // 16))
+        shrink_factor = max(1, min(3, min(vol.shape) // 24))
         if shrink_factor > 1:
             img_small = sitk.Shrink(sitk_img, [shrink_factor] * 3)
             mask_small = sitk.Shrink(sitk_mask, [shrink_factor] * 3)
@@ -121,7 +121,8 @@ def compute_inu_n4(vol: np.ndarray, brain_mask: np.ndarray) -> tuple[float, floa
             mask_small = sitk_mask
 
         n4 = sitk.N4BiasFieldCorrectionImageFilter()
-        n4.SetMaximumNumberOfIterations([30, 20])
+        n4.SetMaximumNumberOfIterations([40, 30, 20])
+        n4.SetBiasFieldFullWidthAtHalfMaximum(0.30)
         n4.SetConvergenceThreshold(1e-6)
         n4.Execute(img_small, mask_small)
 

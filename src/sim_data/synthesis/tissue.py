@@ -1,7 +1,8 @@
 """Tissue Partial Volume Estimation (PVE) & 3T MRI tissue parameter priors.
 
-Supports both:
+Supports:
 - Template-free GMM + MRF spatial regularization from a seed T1w (+ optional co-registered T2w).
+- Optional external brain/ICV mask (Option 2) to cleanly separate intracranial CSF/GM/WM from skull/scalp.
 - Optional external 4D PVE NIfTI resampling into the seed RAS+ grid.
 """
 
@@ -101,9 +102,10 @@ def estimate_tissue_pve(
     target_affine: np.ndarray,
     t2_data: np.ndarray | None = None,
     template_pve_path: str | Path | None = None,
+    brain_mask_path: str | Path | None = None,
     seed: int = 42,
 ) -> TissuePVEMaps:
-    """Estimate smooth soft tissue PVE maps (CSF, GM, WM, Scalp) from T1w (+ optional T2w or template)."""
+    """Estimate smooth soft tissue PVE maps (CSF, GM, WM, Scalp) from T1w (+ optional T2w/mask/template)."""
     t1 = np.nan_to_num(np.asarray(t1_data, dtype=np.float32), nan=0.0, posinf=0.0, neginf=0.0)
     shape = (int(t1.shape[0]), int(t1.shape[1]), int(t1.shape[2]))
 
@@ -137,12 +139,28 @@ def estimate_tissue_pve(
     priors = compute_anatomical_priors(t1)
     head_mask = priors.brain_mask
 
-    # Identify outer boundary rim as scalp candidate while protecting interior cortex/ventricles
-    eroded = ndimage.binary_erosion(head_mask, iterations=2)
-    outer_rim = head_mask & (~eroded)
-    if int(eroded.sum()) < 64:
-        eroded = head_mask
-        outer_rim = np.zeros(shape, dtype=bool)
+    ext_icv: np.ndarray | None = None
+    if brain_mask_path is not None:
+        raw_mask = resample_nifti_to_grid(brain_mask_path, shape, target_affine, order=0)
+        if raw_mask.ndim == 4:
+            raw_mask = raw_mask[..., 0]
+        cand = np.asarray(raw_mask > 0.5, dtype=bool)
+        if int(cand.sum()) >= 64:
+            ext_icv = cand
+            head_mask = head_mask | ext_icv
+
+    if ext_icv is not None:
+        fit_mask = ext_icv
+        outer_rim = head_mask & (~ext_icv)
+    else:
+        # Identify outer boundary rim as scalp candidate while protecting interior cortex/ventricles
+        eroded = ndimage.binary_erosion(head_mask, iterations=2)
+        outer_rim = head_mask & (~eroded)
+        if int(eroded.sum()) < 64:
+            fit_mask = head_mask
+            outer_rim = np.zeros(shape, dtype=bool)
+        else:
+            fit_mask = eroded
 
     fg_vals = t1[head_mask]
     t1_p98 = max(float(np.percentile(fg_vals, 98.0)), 1e-5)
@@ -153,11 +171,11 @@ def estimate_tissue_pve(
         t2 = np.nan_to_num(np.asarray(t2_data, dtype=np.float32), nan=0.0, posinf=0.0, neginf=0.0)
         t2_p98 = max(float(np.percentile(t2[head_mask], 98.0)), 1e-5)
         t2_norm = np.clip(t2 / t2_p98, 0.0, 1.5)
-        feats_fit = np.column_stack([t1_norm[eroded], t2_norm[eroded]])
+        feats_fit = np.column_stack([t1_norm[fit_mask], t2_norm[fit_mask]])
         feats_all = np.column_stack([t1_norm[head_mask], t2_norm[head_mask]])
     else:
         t2_norm = None
-        feats_fit = t1_norm[eroded][:, None]
+        feats_fit = t1_norm[fit_mask][:, None]
         feats_all = t1_norm[head_mask][:, None]
 
     # Fit 3-class GaussianMixture (CSF, GM, WM) on subsampled interior voxels for speed
@@ -191,18 +209,20 @@ def estimate_tissue_pve(
     gm[head_mask] = probs[:, idx_gm].astype(np.float32)
     wm[head_mask] = probs[:, idx_wm].astype(np.float32)
 
-    # Separate outer rim scalp/skull tissue: intermediate-to-low T1 (and low T2 if available) on head exterior
+    # Separate outer rim scalp/skull tissue: outside external ICV mask or outer head shell
     if np.any(outer_rim):
-        if t2_norm is not None:
-            scalp_cand = outer_rim & (t2_norm < float(np.percentile(t2_norm[eroded], 45.0)))
+        if ext_icv is not None:
+            scalp_cand = outer_rim
+        elif t2_norm is not None:
+            scalp_cand = outer_rim & (t2_norm < float(np.percentile(t2_norm[fit_mask], 45.0)))
         else:
-            # Outer shell voxels not clearly bright CSF-dark or WM-bright
             gm_mean_t1 = float(means[idx_gm, 0])
             scalp_cand = outer_rim & (t1_norm < gm_mean_t1 * 0.92)
-        scalp[scalp_cand] = 0.80
-        csf[scalp_cand] *= 0.20
-        gm[scalp_cand] *= 0.20
-        wm[scalp_cand] *= 0.20
+        scalp[scalp_cand] = 0.85 if ext_icv is not None else 0.80
+        keep_w = 0.15 if ext_icv is not None else 0.20
+        csf[scalp_cand] *= keep_w
+        gm[scalp_cand] *= keep_w
+        wm[scalp_cand] *= keep_w
 
     # Mild spatial MRF smoothing of posteriors + exact simplex normalization inside head_mask
     csf = ndimage.gaussian_filter(csf, sigma=0.6) * head_mask
@@ -218,7 +238,7 @@ def estimate_tissue_pve(
     wm = np.where(valid, wm / denom, 0.0).astype(np.float32)
     scalp = np.where(valid, scalp / denom, 0.0).astype(np.float32)
 
-    brain_mask = (csf + gm + wm) > 0.35
+    brain_mask = ext_icv if ext_icv is not None else ((csf + gm + wm) > 0.35)
     return TissuePVEMaps(
         csf=csf,
         gm=gm,

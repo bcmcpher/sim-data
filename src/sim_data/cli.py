@@ -1,22 +1,32 @@
-"""Typer CLI for sim-data: init-phantom, generate, extract-iqms, verify-harmonization, benchmark-deterministic."""
+"""Typer CLI for sim-data: init-phantom, convert-contrast, synthesize-cohort, generate, extract-iqms, analyze-sensitivity, verify-harmonization, benchmark-deterministic."""
 
 from __future__ import annotations
 
 from pathlib import Path
 from typing import Optional, cast
 
+import nibabel as nib
+import numpy as np
 import pandas as pd
 import typer
 from rich.console import Console
 from rich.table import Table
 
-from sim_data.config import CohortSynthesisConfig, Modality, SimulationConfig
+from sim_data.config import (
+    CohortSynthesisConfig,
+    ContrastConversionConfig,
+    Modality,
+    SimulationConfig,
+)
 from sim_data.eval.deterministic_qc import evaluate_deterministic_qc
+from sim_data.eval.sensitivity import run_sensitivity_analysis
 from sim_data.harmonization.audit import run_harmonization_audit
+from sim_data.io.orientation import canonicalize_to_ras
 from sim_data.iqm.extractor import extract_iqms_for_bids_dir
 from sim_data.phantoms.synthetic import generate_synthetic_bids_cohort
 from sim_data.pipeline.engine import run_simulation_plan
 from sim_data.synthesis.cohort import synthesize_cohort
+from sim_data.synthesis.contrast import ContrastTarget, invert_t1w_to_t2w
 
 app = typer.Typer(
     name="sim-data",
@@ -43,10 +53,62 @@ def init_phantom(
     console.print(f"[green]Created synthetic BIDS cohort ({n_subjects} subjects) at:[/green] {root}")
 
 
+_VALID_CONTRAST_TARGETS: set[str] = {"T2w", "bold_s0", "dwi_b0"}
+
+
+@app.command("convert-contrast")
+def convert_contrast_cmd(
+    t1w: Path = typer.Option(..., "--t1w", exists=True, help="Input clean 3D T1w NIfTI file."),
+    out: Path = typer.Option(..., "--out", help="Output NIfTI file path for converted contrast."),
+    target: str = typer.Option(
+        "T2w", "--target", help="Target contrast polarity: T2w, bold_s0, or dwi_b0."
+    ),
+    brain_mask: Optional[Path] = typer.Option(
+        None, "--brain-mask", exists=True, help="Optional external brain/ICV mask NIfTI (Option 2)."
+    ),
+    no_n4: bool = typer.Option(
+        False, "--no-n4", help="Skip SimpleITK N4ITK bias correction before contrast conversion."
+    ),
+    seed: int = typer.Option(42, "--seed", help="Random seed for GMM tissue anchoring."),
+) -> None:
+    """Convert a clean T1w NIfTI into continuous T2w, BOLD S0, or DWI b=0 contrast."""
+    if target not in _VALID_CONTRAST_TARGETS:
+        raise typer.BadParameter(
+            f"Unknown target '{target}'. Expected one of {sorted(_VALID_CONTRAST_TARGETS)}"
+        )
+
+    img = nib.load(str(t1w))
+    if not isinstance(img, nib.Nifti1Image):
+        if isinstance(img, nib.spatialimages.SpatialImage):
+            img = nib.Nifti1Image(np.asarray(img.get_fdata(), dtype=np.float32), img.affine)
+        else:
+            raise typer.BadParameter(f"Unsupported image type: {type(img).__name__}")
+
+    t1_data, affine, _zooms = canonicalize_to_ras(img)
+    cfg = ContrastConversionConfig(n4_bias_correct=not no_n4)
+    res = invert_t1w_to_t2w(
+        t1_data=t1_data,
+        affine=affine,
+        target=cast(ContrastTarget, target),
+        cfg=cfg,
+        brain_mask_path=brain_mask,
+        seed=seed,
+    )
+    out.parent.mkdir(parents=True, exist_ok=True)
+    nib.save(nib.Nifti1Image(res.data, affine), str(out))
+    console.print(
+        f"[green]Converted T1w -> {target} ({res.backend}, external_mask={res.used_external_mask}) ->[/green] {out}"
+    )
+    console.print(f"  T1 anchors (CSF/GM/WM): {res.tissue_anchors_t1}")
+
+
 @app.command("synthesize-cohort")
 def synthesize_cohort_cmd(
     seed_bids: Path = typer.Option(
-        ..., "--seed-bids", exists=True, help="Clean structural seed BIDS directory (3-5+ subjects recommended)."
+        ...,
+        "--seed-bids",
+        exists=True,
+        help="Clean real BIDS directory (T1w required; optional T2w/FLAIR/bold/dwi/brain masks).",
     ),
     out: Path = typer.Option(..., "--out", help="Output clean synthesized multimodal BIDS directory."),
     config: Optional[Path] = typer.Option(
@@ -61,6 +123,14 @@ def synthesize_cohort_cmd(
     allow_few_seeds: bool = typer.Option(
         False, "--allow-few-seeds", help="Allow running with fewer than min_seed_subjects (default 3)."
     ),
+    preserve_real: bool = typer.Option(
+        False,
+        "--preserve-real",
+        help="Keep real subjects' existing modalities untouched (zero warp) and synthesize only missing modalities.",
+    ),
+    brain_mask: Optional[Path] = typer.Option(
+        None, "--brain-mask", exists=True, help="Optional external brain/ICV mask NIfTI (Option 2)."
+    ),
     tissue_pve: Optional[Path] = typer.Option(
         None, "--tissue-pve", exists=True, help="Optional 4D CSF/GM/WM[/Scalp] PVE template NIfTI."
     ),
@@ -73,7 +143,7 @@ def synthesize_cohort_cmd(
     workers: int = typer.Option(1, "--workers", min=1, help="Parallel worker processes."),
     device: str = typer.Option("auto", "--device", help="PyTorch compute device: auto, cpu, or cuda."),
 ) -> None:
-    """Expand 3-5+ clean structural BIDS seeds into N distinct, co-registered multimodal subjects."""
+    """Expand structural BIDS seeds into N multimodal subjects or complete missing modalities (--preserve-real)."""
     cfg = CohortSynthesisConfig.from_yaml(config) if config is not None else CohortSynthesisConfig()
     if n_subjects is not None:
         cfg.n_subjects = n_subjects
@@ -81,6 +151,10 @@ def synthesize_cohort_cmd(
         cfg.warp.strength = warp_strength
     if allow_few_seeds:
         cfg.allow_few_seeds = True
+    if preserve_real:
+        cfg.preserve_real_modalities = True
+    if brain_mask is not None:
+        cfg.templates.brain_mask_nifti = brain_mask
     if tissue_pve is not None:
         cfg.templates.tissue_pve_nifti = tissue_pve
     if rsn_template is not None:
@@ -95,8 +169,9 @@ def synthesize_cohort_cmd(
         workers=workers,
         device=device,
     )
+    mode_lbl = "Completed native real" if cfg.preserve_real_modalities else "Synthesized"
     console.print(
-        f"[green]Synthesized {res.n_subjects} multimodal subjects from {res.n_seed_subjects} seed(s) in:[/green] {res.out_dir}"
+        f"[green]{mode_lbl} {res.n_subjects} multimodal subject(s) from {res.n_seed_subjects} seed(s) in:[/green] {res.out_dir}"
     )
     console.print(f"  synthesis manifest: {res.manifest_path}")
 
@@ -105,7 +180,7 @@ def synthesize_cohort_cmd(
 def generate(
     bids_dir: Path = typer.Option(..., "--bids-dir", exists=True, help="Clean input BIDS directory."),
     config: Path = typer.Option(..., "--config", exists=True, help="YAML simulation configuration."),
-    out_dir: Path = typer.Option(..., "--out-dir", help="Output blinded BIDS directory."),
+    out_dir: Path = typer.Option(..., "--out-dir", help="Output simulated BIDS directory."),
     manifest_out: Optional[Path] = typer.Option(
         None,
         "--manifest-out",
@@ -114,8 +189,13 @@ def generate(
     workers: int = typer.Option(1, "--workers", min=1, help="Parallel worker processes."),
     device: str = typer.Option("auto", "--device", help="PyTorch compute device: auto, cpu, or cuda."),
 ) -> None:
-    """Generate a blinded simulated BIDS dataset and official ground-truth manifest.tsv."""
+    """Generate a simulated BIDS dataset and official ground-truth manifest.tsv."""
     cfg = SimulationConfig.from_yaml(config)
+    if cfg.output.naming_scheme == "unblinded_validation":
+        console.print(
+            "[yellow]WARNING: output.naming_scheme='unblinded_validation' embeds artifact/dose labels "
+            "in filenames. Use ONLY for internal validation/debugging—never for blinded human or AI QC evaluation.[/yellow]"
+        )
     res = run_simulation_plan(
         bids_dir=bids_dir,
         config=cfg,
@@ -124,7 +204,9 @@ def generate(
         device=device,
         manifest_out=manifest_out,
     )
-    console.print(f"[green]Generated {res.n_scans_generated} blinded BIDS scans in:[/green] {res.out_dir}")
+    console.print(
+        f"[green]Generated {res.n_scans_generated} BIDS scans (naming={cfg.output.naming_scheme}) in:[/green] {res.out_dir}"
+    )
     console.print(f"  manifest (tsv): {res.manifest_path}")
 
 
@@ -157,6 +239,48 @@ def extract_iqms_cmd(
         workers=workers,
     )
     console.print(f"[green]Extracted blind IQMs for {len(df)} scans ->[/green] {out}")
+
+
+@app.command("analyze-sensitivity")
+def analyze_sensitivity_cmd(
+    manifest: Path = typer.Option(..., "--manifest", exists=True, help="Path to ground-truth manifest.tsv."),
+    out_dir: Path = typer.Option(..., "--out-dir", help="Output directory for sensitivity summary, matrix & plots."),
+    iqms: Optional[Path] = typer.Option(
+        None,
+        "--iqms",
+        exists=True,
+        help="Optional external IQMs TSV (from `sim-data extract-iqms` or MRIQC/fMRIPrep/QSIPrep).",
+    ),
+    modality: Optional[str] = typer.Option(None, "--modality", help="Modality subset to analyze."),
+) -> None:
+    """Rank IQM sensitivity, monotonicity (Spearman ρ), MDS/LoD, and specificity across dose trajectories."""
+    df = _load_tsv(manifest)
+    iqms_df = _load_tsv(iqms) if iqms is not None else None
+    res = run_sensitivity_analysis(df, out_dir=out_dir, iqms_df=iqms_df, modality=modality)
+
+    table = Table(
+        title=f"Top Sensitive IQMs ({res.report['modality']}, trajectories={res.report['n_trajectories']})"
+    )
+    table.add_column("Artifact")
+    table.add_column("Top IQM")
+    table.add_column("Spearman ρ", justify="right")
+    table.add_column("Max Cohen's d", justify="right")
+    table.add_column("MDS / LoD", justify="right")
+    table.add_column("Specificity", justify="right")
+    for art, top_list in res.report["top_iqms_per_artifact"].items():
+        if not top_list:
+            continue
+        best = top_list[0]
+        table.add_row(
+            art,
+            str(best["iqm"]),
+            f"{best['mean_spearman_rho']:+.3f}",
+            f"{best['max_effect_cohens_d']:+.2f}",
+            str(best["min_detectable_severity"]) if best["min_detectable_severity"] is not None else "-",
+            f"{best['specificity_ratio']:.2f}",
+        )
+    console.print(table)
+    console.print(f"Sensitivity summary saved to: {res.summary_path}")
 
 
 @app.command("verify-harmonization")

@@ -10,7 +10,7 @@ from typing import Any
 import numpy as np
 import torch
 
-from sim_data.config import Modality
+from sim_data.config import Modality, NoiseCalibrationMode
 from sim_data.io.orientation import AnatomicalPriors
 
 
@@ -63,6 +63,10 @@ class ScanContext:
     bvals: np.ndarray | None = None
     bvecs: np.ndarray | None = None  # shape (3, T)
     rotate_dwi_bvecs: bool = False
+    coupled_trajectory: bool = False
+    baseline_noise_sigma: float = 0.0
+    noise_calibration: NoiseCalibrationMode = "excess_variance"
+    site_seed: int | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
 
     @property

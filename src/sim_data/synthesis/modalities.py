@@ -1,4 +1,4 @@
-"""Forward MRI physics synthesizers: Bloch structural (T1w/T2w/FLAIR), 4D BOLD, and 4D DWI."""
+"""Sequential forward MRI physics synthesizers: T1w -> T2w contrast conversion, FLAIR, 4D BOLD, and 4D DWI."""
 
 from __future__ import annotations
 
@@ -15,13 +15,43 @@ from sim_data.artifacts.base import resolve_device
 from sim_data.artifacts.noise import apply_noncentral_chi_noise
 from sim_data.config import (
     BoldSynthesisConfig,
+    ContrastConversionConfig,
     DwiSynthesisConfig,
     Modality,
     StructuralSynthesisConfig,
 )
 from sim_data.io.bids import sample_electrostatic_directions
+from sim_data.synthesis.contrast import get_contrast_converter
 from sim_data.synthesis.tissue import TissueMRIParams, TissuePVEMaps, resample_nifti_to_grid
 from sim_data.synthesis.warp import DiffeomorphicField, warp_vector_field_ppd, warp_volume
+
+
+def _downsample_volume_to_spacing(
+    vol: np.ndarray,
+    src_affine: np.ndarray,
+    src_zooms: tuple[float, float, float],
+    target_zooms: tuple[float, float, float],
+    target_spec: tuple[tuple[int, int, int], np.ndarray] | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Anti-aliased Gaussian pre-filter + linear resampling to coarser target voxel spacing."""
+    sigmas = tuple(
+        0.45 * max(0.0, float(target_zooms[i]) / max(float(src_zooms[i]), 0.1) - 1.0)
+        for i in range(3)
+    )
+    filtered = (
+        ndimage.gaussian_filter(vol.astype(np.float32), sigma=sigmas)
+        if any(s > 0.05 for s in sigmas)
+        else vol.astype(np.float32)
+    )
+    img = nib.Nifti1Image(filtered, src_affine)
+    if target_spec is not None:
+        res = nib_proc.resample_from_to(img, target_spec, order=1)
+    else:
+        res = nib_proc.resample_to_output(img, voxel_sizes=target_zooms, order=1)
+    return (
+        np.asarray(res.get_fdata(dtype=np.float32), dtype=np.float32),
+        np.asarray(res.affine, dtype=np.float64),
+    )
 
 
 def _resample_pve_to_spacing(
@@ -30,40 +60,32 @@ def _resample_pve_to_spacing(
     src_zooms: tuple[float, float, float],
     target_zooms: tuple[float, float, float],
 ) -> tuple[TissuePVEMaps, np.ndarray]:
-    """Resample 3D tissue PVE maps to target voxel spacing via nibabel.processing.resample_to_output."""
-    _ = src_zooms
-    res_csf = nib_proc.resample_to_output(
-        nib.Nifti1Image(pve.csf, src_affine), voxel_sizes=target_zooms, order=1
+    """Resample 3D tissue PVE maps to target voxel spacing via anti-aliased nibabel resampling."""
+    csf_raw, target_affine = _downsample_volume_to_spacing(
+        pve.csf, src_affine, src_zooms, target_zooms
     )
-    target_spec = (res_csf.shape[:3], res_csf.affine)
-    csf = np.clip(np.asarray(res_csf.get_fdata(dtype=np.float32), dtype=np.float32), 0.0, 1.0)
+    target_shape = (int(csf_raw.shape[0]), int(csf_raw.shape[1]), int(csf_raw.shape[2]))
+    target_spec = (target_shape, target_affine)
+
+    csf = np.clip(csf_raw, 0.0, 1.0)
     gm = np.clip(
-        np.asarray(
-            nib_proc.resample_from_to(
-                nib.Nifti1Image(pve.gm, src_affine), target_spec, order=1
-            ).get_fdata(dtype=np.float32),
-            dtype=np.float32,
-        ),
+        _downsample_volume_to_spacing(
+            pve.gm, src_affine, src_zooms, target_zooms, target_spec=target_spec
+        )[0],
         0.0,
         1.0,
     )
     wm = np.clip(
-        np.asarray(
-            nib_proc.resample_from_to(
-                nib.Nifti1Image(pve.wm, src_affine), target_spec, order=1
-            ).get_fdata(dtype=np.float32),
-            dtype=np.float32,
-        ),
+        _downsample_volume_to_spacing(
+            pve.wm, src_affine, src_zooms, target_zooms, target_spec=target_spec
+        )[0],
         0.0,
         1.0,
     )
     scalp = np.clip(
-        np.asarray(
-            nib_proc.resample_from_to(
-                nib.Nifti1Image(pve.scalp, src_affine), target_spec, order=1
-            ).get_fdata(dtype=np.float32),
-            dtype=np.float32,
-        ),
+        _downsample_volume_to_spacing(
+            pve.scalp, src_affine, src_zooms, target_zooms, target_spec=target_spec
+        )[0],
         0.0,
         1.0,
     )
@@ -86,7 +108,7 @@ def _resample_pve_to_spacing(
             brain_mask=np.asarray(brain_mask, dtype=bool),
             head_mask=np.asarray(head_mask, dtype=bool),
         ),
-        np.asarray(res_csf.affine, dtype=np.float64),
+        target_affine,
     )
 
 
@@ -99,13 +121,47 @@ def synthesize_structural_modality(
     cfg: StructuralSynthesisConfig,
     rng: np.random.Generator,
     device: str = "auto",
+    affine: np.ndarray | None = None,
+    contrast_cfg: ContrastConversionConfig | None = None,
+    brain_mask_array: np.ndarray | None = None,
 ) -> tuple[np.ndarray, dict[str, float]]:
-    """Synthesize clean T1w, T2w, or FLAIR volume using Bloch equations + real seed micro-texture."""
+    """Synthesize clean T1w, T2w, or FLAIR volume using contrast conversion / Bloch physics."""
+    eff_affine = affine if affine is not None else np.eye(4, dtype=np.float64)
     comp_map = {"wm": pve.wm, "gm": pve.gm, "csf": pve.csf, "scalp": pve.scalp}
+
+    # For T2w without a paired real T2w, use continuous tissue-aware T1w -> T2w conversion
+    if modality == "T2w" and warped_t2 is None:
+        converter = get_contrast_converter(contrast_cfg)
+        conv = converter.convert(
+            t1_data=warped_t1,
+            affine=eff_affine,
+            target="T2w",
+            params=params,
+            cfg=contrast_cfg,
+            brain_mask_array=brain_mask_array,
+            seed=int(rng.integers(0, 2**31 - 1)),
+        )
+        signal = conv.data
+        sidecar_timing = {"RepetitionTime": 3.2, "EchoTime": 0.408}
+        fg_med = (
+            float(np.median(signal[conv.icv_mask]))
+            if np.any(conv.icv_mask)
+            else 500.0
+        )
+        sigma = fg_med / max(cfg.baseline_snr, 1.0)
+        noisy = apply_noncentral_chi_noise(
+            signal,
+            sigma=sigma,
+            coil_count=1,
+            seed=int(rng.integers(0, 2**31 - 1)),
+            device=resolve_device(device),
+        )
+        return noisy, sidecar_timing
+
     signal = np.zeros(pve.wm.shape, dtype=np.float32)
 
     if modality == "T1w":
-        tr_ms, te_ms, ti_ms = 650.0, 10.0, 0.0
+        tr_ms, te_ms = 650.0, 10.0
         for name, frac in comp_map.items():
             w = (
                 params.rho[name]
@@ -115,7 +171,7 @@ def synthesize_structural_modality(
             signal += frac * float(w)
         sidecar_timing = {"RepetitionTime": 2.3, "EchoTime": 0.0029}
     elif modality == "T2w":
-        tr_ms, te_ms, ti_ms = 4500.0, 100.0, 0.0
+        tr_ms, te_ms = 4500.0, 100.0
         for name, frac in comp_map.items():
             w = (
                 params.rho[name]
@@ -127,7 +183,6 @@ def synthesize_structural_modality(
     else:  # FLAIR (CSF-nulled inversion recovery)
         tr_ms, te_ms = 9000.0, 110.0
         t1_csf = params.t1_ms["csf"]
-        # Null point for CSF longitudinal magnetization
         ti_ms = float(t1_csf * np.log(2.0 / (1.0 + np.exp(-tr_ms / t1_csf))))
         for name, frac in comp_map.items():
             ir_factor = abs(
@@ -143,17 +198,24 @@ def synthesize_structural_modality(
             "InversionTime": round(ti_ms / 1000.0, 3),
         }
 
-    # Preserve realistic fine anatomical micro-texture from the warped real seed scan
-    tex_src = warped_t2 if (modality in ("T2w", "FLAIR") and warped_t2 is not None) else warped_t1
+    # Preserve realistic fine anatomical micro-texture with polarity-aware sign
+    using_t2_tex = modality in ("T2w", "FLAIR") and warped_t2 is not None
+    tex_src = warped_t2 if (using_t2_tex and warped_t2 is not None) else warped_t1
     w_tex = cfg.preserve_seed_texture_weight
     if w_tex > 0.0 and np.any(pve.head_mask):
         smooth_seed = ndimage.gaussian_filter(tex_src, sigma=2.2)
         p10 = max(float(np.percentile(tex_src[pve.head_mask], 10.0)), 1e-4)
         detail_ratio = np.clip(tex_src / np.maximum(smooth_seed, p10), 0.78, 1.24)
-        tex_mod = np.where(pve.head_mask, 1.0 + w_tex * (detail_ratio - 1.0), 1.0).astype(
-            np.float32
-        )
-        signal = signal * tex_mod
+        if modality == "FLAIR" and not using_t2_tex:
+            # On FLAIR, GM > WM (inverted relative to T1w), while CSF is dark in both T1w & FLAIR
+            parenchyma = (pve.gm + pve.wm) > pve.csf
+            detail_sign = np.where(parenchyma, -1.0, 1.0).astype(np.float32)
+        else:
+            detail_sign = np.ones_like(detail_ratio, dtype=np.float32)
+        tex_mod = np.where(
+            pve.head_mask, 1.0 + w_tex * detail_sign * (detail_ratio - 1.0), 1.0
+        ).astype(np.float32)
+        signal = np.maximum(signal * tex_mod, 0.0)
 
     # Normalize foreground scale to standard ~1000 MRI units
     if np.any(pve.brain_mask):
@@ -204,22 +266,35 @@ def synthesize_bold_4d(
     rsn_template_path: Path | None,
     rng: np.random.Generator,
     device: str = "auto",
+    t2_base_vol: np.ndarray | None = None,
+    fat_retention_epi: float = 0.12,
+    t2_base_is_fat_suppressed: bool = False,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Synthesize a clean 4D BOLD EPI timeseries with resting-state GM RSNs, physio, and AR(1) noise."""
+    """Synthesize a clean 4D BOLD EPI timeseries sequentially from high-res T2w/T2* contrast."""
     epi_pve, epi_affine = _resample_pve_to_spacing(pve, src_affine, src_zooms, cfg.voxel_size_mm)
     shape = epi_pve.wm.shape
     n_t = cfg.n_trs
     te_ms = cfg.te_sec * 1000.0
 
-    # T2*-weighted EPI baseline volume S0
-    s0 = np.zeros(shape, dtype=np.float32)
-    for name, frac in [
-        ("wm", epi_pve.wm),
-        ("gm", epi_pve.gm),
-        ("csf", epi_pve.csf),
-        ("scalp", epi_pve.scalp * 0.45),
-    ]:
-        s0 += frac * float(params.rho[name] * np.exp(-te_ms / params.t2s_ms[name]))
+    # Derive EPI S0 baseline sequentially from high-res T2-like volume (real T2w or inverted T1w)
+    if t2_base_vol is not None and t2_base_vol.shape == pve.wm.shape:
+        target_spec = ((int(shape[0]), int(shape[1]), int(shape[2])), epi_affine)
+        s0, _ = _downsample_volume_to_spacing(
+            t2_base_vol, src_affine, src_zooms, cfg.voxel_size_mm, target_spec=target_spec
+        )
+        s0 = np.maximum(s0, 0.0).astype(np.float32)
+        if not t2_base_is_fat_suppressed:
+            # Apply EPI fat suppression on extracranial scalp when sourced from clinical FSE T2w
+            s0 = s0 * (1.0 - (1.0 - fat_retention_epi) * epi_pve.scalp)
+    else:
+        s0 = np.zeros(shape, dtype=np.float32)
+        for name, frac in [
+            ("wm", epi_pve.wm),
+            ("gm", epi_pve.gm),
+            ("csf", epi_pve.csf),
+            ("scalp", epi_pve.scalp * 0.45),
+        ]:
+            s0 += frac * float(params.rho[name] * np.exp(-te_ms / params.t2s_ms[name]))
 
     if np.any(epi_pve.brain_mask):
         p95 = max(float(np.percentile(s0[epi_pve.brain_mask], 95.0)), 1e-5)
@@ -230,15 +305,14 @@ def synthesize_bold_4d(
     if cfg.gm_bold_pct > 0.0 and np.any(epi_pve.gm > 0.1):
         spatial_maps: list[np.ndarray] = []
         if rsn_template_path is not None:
-            # Load template in seed structural space, warp coherently, then resample to EPI grid
             src_shape = (int(pve.wm.shape[0]), int(pve.wm.shape[1]), int(pve.wm.shape[2]))
             tpl = resample_nifti_to_grid(rsn_template_path, src_shape, src_affine, order=0)
             zoom_epi = tuple(float(shape[i]) / float(src_shape[i]) for i in range(3))
             if tpl.ndim == 3:
                 warped_lbl = warp_volume(np.rint(tpl).astype(np.int32), warp_field, order=0)
-                epi_lbl = np.rint(ndimage.zoom(warped_lbl.astype(np.float32), zoom_epi, order=0)).astype(
-                    np.int32
-                )
+                epi_lbl = np.rint(
+                    ndimage.zoom(warped_lbl.astype(np.float32), zoom_epi, order=0)
+                ).astype(np.int32)
                 unique_ids = [int(u) for u in np.unique(epi_lbl) if u > 0][:16]
                 for uid in unique_ids:
                     m = ndimage.gaussian_filter((epi_lbl == uid).astype(np.float32), sigma=0.8)
@@ -251,7 +325,6 @@ def synthesize_bold_4d(
                     max_abs = max(float(np.max(np.abs(ec))), 1e-5)
                     spatial_maps.append((ec / max_abs) * epi_pve.gm)
         else:
-            # Template-free: 8 smooth resting-state spatial clusters masked to cortical GM
             for _ in range(8):
                 raw_field = rng.normal(0.0, 1.0, size=shape).astype(np.float32)
                 smooth_f = ndimage.gaussian_filter(raw_field, sigma=3.0)
@@ -261,8 +334,7 @@ def synthesize_bold_4d(
         if spatial_maps:
             n_comp = len(spatial_maps)
             tcs = _bandpass_timecourses(n_comp, n_t, cfg.tr_sec, 0.01, 0.10, rng)
-            maps_stack = np.stack(spatial_maps, axis=0)  # (K, X, Y, Z)
-            # Vectorized tensor contraction: (K, X, Y, Z) x (K, T) -> (X, Y, Z, T)
+            maps_stack = np.stack(spatial_maps, axis=0)
             rsn_4d = np.tensordot(maps_stack, tcs, axes=([0], [0])).astype(np.float32)
             rsn_4d /= np.sqrt(float(n_comp))
             bold_mod += cfg.gm_bold_pct * rsn_4d
@@ -277,15 +349,17 @@ def synthesize_bold_4d(
         edge = epi_pve.brain_mask & (~ndimage.binary_erosion(epi_pve.brain_mask, iterations=1))
         physio_mask = np.clip(epi_pve.csf + 0.5 * edge.astype(np.float32), 0.0, 1.0)
         physio_sig = 0.6 * resp_wave + 0.4 * card_wave
-        bold_mod += (cfg.physio_pct * physio_mask[..., None] * physio_sig[None, None, None, :]).astype(
-            np.float32
-        )
+        bold_mod += (
+            cfg.physio_pct * physio_mask[..., None] * physio_sig[None, None, None, :]
+        ).astype(np.float32)
 
     # 3. Spatially smooth AR(1) temporal noise inside head
     if cfg.ar1_phi > 0.0:
         ar_scale = 0.008
         ar_noise = np.zeros((*shape, n_t), dtype=np.float32)
-        prev = ndimage.gaussian_filter(rng.normal(0.0, 1.0, size=shape).astype(np.float32), sigma=1.0)
+        prev = ndimage.gaussian_filter(
+            rng.normal(0.0, 1.0, size=shape).astype(np.float32), sigma=1.0
+        )
         ar_noise[..., 0] = prev
         innov_sd = float(np.sqrt(max(1.0 - cfg.ar1_phi**2, 0.05)))
         for t in range(1, n_t):
@@ -331,19 +405,14 @@ def _build_anatomical_wm_fiber_field(
         np.arange(shape[2], dtype=np.float32),
         indexing="ij",
     )
-    nx = 2.0 * (gx - bmin[0]) / (bmax[0] - bmin[0]) - 1.0  # [-1, 1] L->R
-    ny = 2.0 * (gy - bmin[1]) / (bmax[1] - bmin[1]) - 1.0  # [-1, 1] P->A
-    nz = 2.0 * (gz - bmin[2]) / (bmax[2] - bmin[2]) - 1.0  # [-1, 1] I->S
+    nx = 2.0 * (gx - bmin[0]) / (bmax[0] - bmin[0]) - 1.0
+    ny = 2.0 * (gy - bmin[1]) / (bmax[1] - bmin[1]) - 1.0
+    nz = 2.0 * (gz - bmin[2]) / (bmax[2] - bmin[2]) - 1.0
 
-    # Smooth anatomical zone blending:
-    # - Corpus callosum (central midline, mid-superior): strong R-L (x)
     cc_w = np.exp(-((nx / 0.35) ** 2 + (ny / 0.55) ** 2 + ((nz - 0.15) / 0.30) ** 2))
-    # - Brainstem & corticospinal tract (inferior-central): strong I-S (z)
     cst_w = np.exp(-((nx / 0.32) ** 2 + ((ny + 0.12) / 0.35) ** 2 + ((nz + 0.55) / 0.45) ** 2))
-    # - Bilateral association tracts (SLF/IFOF): strong A-P (y)
     assoc_w = np.exp(-(((np.abs(nx) - 0.48) / 0.32) ** 2 + (ny / 0.70) ** 2 + (nz / 0.55) ** 2))
 
-    # Mild smooth random curvature perturbation for inter-subject microstructural diversity
     px = ndimage.gaussian_filter(rng.normal(0.0, 0.35, size=shape).astype(np.float32), sigma=4.0)
     py = ndimage.gaussian_filter(rng.normal(0.0, 0.35, size=shape).astype(np.float32), sigma=4.0)
     pz = ndimage.gaussian_filter(rng.normal(0.0, 0.35, size=shape).astype(np.float32), sigma=4.0)
@@ -372,10 +441,8 @@ def _extract_primary_eigenvector_from_template(
         norms = np.linalg.norm(raw, axis=-1, keepdims=True) + 1e-6
         return np.asarray(raw / norms, dtype=np.float32)
 
-    # Lower-triangular 6-component tensor -> principal eigenvector via DIPY
     tensors = from_lower_triangular(raw)
     _evals, evecs = decompose_tensor(tensors)
-    # DIPY decompose_tensor sorts eigenvalues descending; index 0 is principal eigenvector
     v1 = np.asarray(evecs[..., :, 0], dtype=np.float32)
     norms = np.linalg.norm(v1, axis=-1, keepdims=True) + 1e-6
     return np.asarray(v1 / norms, dtype=np.float32)
@@ -391,11 +458,13 @@ def synthesize_dwi_4d(
     dti_template_path: Path | None,
     rng: np.random.Generator,
     device: str = "auto",
+    t2_base_vol: np.ndarray | None = None,
+    fat_retention_epi: float = 0.12,
+    t2_base_is_fat_suppressed: bool = False,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Synthesize clean multi-shell 4D DWI + affine + bvals + bvecs via vectorized multi-tensor model."""
+    """Synthesize clean multi-shell 4D DWI sequentially from high-res T2w/b=0 contrast."""
     src_shape = (int(pve.wm.shape[0]), int(pve.wm.shape[1]), int(pve.wm.shape[2]))
 
-    # Build or load fiber orientation field in seed structural space, warp & PPD-reorient
     if dti_template_path is not None:
         v1_seed = _extract_primary_eigenvector_from_template(
             dti_template_path, src_shape, src_affine
@@ -405,7 +474,6 @@ def synthesize_dwi_4d(
 
     v1_warped = warp_vector_field_ppd(v1_seed, warp_field)
 
-    # Resample warped PVE and primary fiber field to DWI resolution
     dwi_pve, dwi_affine = _resample_pve_to_spacing(pve, src_affine, src_zooms, cfg.voxel_size_mm)
     dwi_shape = dwi_pve.wm.shape
     zoom_dwi = tuple(float(dwi_shape[i]) / float(src_shape[i]) for i in range(3))
@@ -426,9 +494,15 @@ def synthesize_dwi_4d(
     v2 = (v2 / (np.linalg.norm(v2, axis=-1, keepdims=True) + 1e-6)).astype(np.float32)
 
     # Spatially smooth crossing-fiber mask inside white matter
-    cross_field = ndimage.gaussian_filter(rng.normal(0.0, 1.0, size=dwi_shape).astype(np.float32), sigma=2.5)
+    cross_field = ndimage.gaussian_filter(
+        rng.normal(0.0, 1.0, size=dwi_shape).astype(np.float32), sigma=2.5
+    )
     if cfg.crossing_fiber_fraction > 0.0 and np.any(dwi_pve.wm > 0.2):
-        thresh = float(np.percentile(cross_field[dwi_pve.wm > 0.2], 100.0 * (1.0 - cfg.crossing_fiber_fraction)))
+        thresh = float(
+            np.percentile(
+                cross_field[dwi_pve.wm > 0.2], 100.0 * (1.0 - cfg.crossing_fiber_fraction)
+            )
+        )
         w_cross = np.where(cross_field >= thresh, 0.42, 0.0).astype(np.float32)
     else:
         w_cross = np.zeros(dwi_shape, dtype=np.float32)
@@ -440,29 +514,39 @@ def synthesize_dwi_4d(
         bval_parts.append(np.full(int(n_dirs), float(b_val), dtype=np.float32))
         bvec_parts.append(sample_electrostatic_directions(int(n_dirs), rng))
     bvals = np.concatenate(bval_parts, axis=0)
-    bvecs = np.hstack(bvec_parts).astype(np.float32)  # (3, N_vols)
+    bvecs = np.hstack(bvec_parts).astype(np.float32)
 
-    # T2-weighted b=0 baseline S0
+    # Derive b=0 S0 baseline sequentially from high-res T2w contrast (real T2w or inverted T1w)
     te_ms = cfg.te_sec * 1000.0
-    s0 = np.zeros(dwi_shape, dtype=np.float32)
-    for name, frac in [
-        ("wm", dwi_pve.wm),
-        ("gm", dwi_pve.gm),
-        ("csf", dwi_pve.csf),
-        ("scalp", dwi_pve.scalp * 0.35),
-    ]:
-        s0 += frac * float(params.rho[name] * np.exp(-te_ms / params.t2_ms[name]))
+    if t2_base_vol is not None and t2_base_vol.shape == pve.wm.shape:
+        target_spec = ((int(dwi_shape[0]), int(dwi_shape[1]), int(dwi_shape[2])), dwi_affine)
+        s0, _ = _downsample_volume_to_spacing(
+            t2_base_vol, src_affine, src_zooms, cfg.voxel_size_mm, target_spec=target_spec
+        )
+        s0 = np.maximum(s0, 0.0).astype(np.float32)
+        if not t2_base_is_fat_suppressed:
+            s0 = s0 * (1.0 - (1.0 - fat_retention_epi) * dwi_pve.scalp)
+    else:
+        s0 = np.zeros(dwi_shape, dtype=np.float32)
+        for name, frac in [
+            ("wm", dwi_pve.wm),
+            ("gm", dwi_pve.gm),
+            ("csf", dwi_pve.csf),
+            ("scalp", dwi_pve.scalp * 0.35),
+        ]:
+            s0 += frac * float(params.rho[name] * np.exp(-te_ms / params.t2_ms[name]))
+
     if np.any(dwi_pve.brain_mask):
         p95 = max(float(np.percentile(s0[dwi_pve.brain_mask], 95.0)), 1e-5)
         s0 = s0 * (900.0 / p95)
 
-    # Vectorized multi-compartment Stejskal-Tanner signal evaluation on PyTorch device (CPU or RTX 5080)
+    # Vectorized multi-compartment Stejskal-Tanner signal evaluation on PyTorch device
     dev = resolve_device(device)
-    b_t = torch.from_numpy(bvals).to(dev)  # (T,)
-    g_t = torch.from_numpy(bvecs).to(dev)  # (3, T)
-    v1_t = torch.from_numpy(v1).to(dev)  # (X, Y, Z, 3)
-    v2_t = torch.from_numpy(v2).to(dev)  # (X, Y, Z, 3)
-    w_cross_t = torch.from_numpy(w_cross).to(dev)[..., None]  # (X, Y, Z, 1)
+    b_t = torch.from_numpy(bvals).to(dev)
+    g_t = torch.from_numpy(bvecs).to(dev)
+    v1_t = torch.from_numpy(v1).to(dev)
+    v2_t = torch.from_numpy(v2).to(dev)
+    w_cross_t = torch.from_numpy(w_cross).to(dev)[..., None]
 
     f_wm = torch.from_numpy(dwi_pve.wm).to(dev)[..., None]
     f_gm = torch.from_numpy(dwi_pve.gm).to(dev)[..., None]
@@ -470,11 +554,9 @@ def synthesize_dwi_4d(
     f_sc = torch.from_numpy(dwi_pve.scalp).to(dev)[..., None]
     s0_t = torch.from_numpy(s0).to(dev)[..., None]
 
-    # Realistic 3T diffusivities in mm^2/s (b in s/mm^2)
     d_par_wm, d_perp_wm = 1.7e-3, 0.25e-3
     d_gm, d_csf, d_sc = 0.80e-3, 3.0e-3, 1.1e-3
 
-    # Projection (g . v)^2 for fiber populations 1 and 2 -> shape (X, Y, Z, T)
     cos2_1 = torch.einsum("xyzi,it->xyzt", v1_t, g_t) ** 2
     cos2_2 = torch.einsum("xyzi,it->xyzt", v2_t, g_t) ** 2
 
@@ -491,7 +573,6 @@ def synthesize_dwi_4d(
     att_total = (f_wm * att_wm + f_gm * att_gm + f_csf * att_csf + f_sc * att_sc) / denom_f
     clean_dwi = (s0_t * att_total).detach().cpu().numpy().astype(np.float32)
 
-    # Clean baseline magnitude Rician noise
     fg_med = float(np.median(s0[dwi_pve.brain_mask])) if np.any(dwi_pve.brain_mask) else 450.0
     sigma = fg_med / max(cfg.baseline_snr, 1.0)
     dwi_4d = apply_noncentral_chi_noise(

@@ -8,6 +8,8 @@ Split cleanly into two physical stages:
    - Subtle gradient nonlinearity / isotropic-anisotropic voxel scaling
 2. Reconstruction noise floor (Stage NOISE_DRIFT):
    - Multi-coil Non-Central Chi (L coils) + spatial parallel-imaging g-factor noise floor
+
+Supports `site.passthrough=True` for untouched native real-scanner baselines (bit-for-bit identity at s=0).
 """
 
 from __future__ import annotations
@@ -42,7 +44,9 @@ def _build_polynomial_bias(
 
     log_field = cx * gx + cy * gy + cz * gz
     if order >= 2:
-        log_field = log_field + 0.45 * (cx * (gx**2 - 0.33) + cy * (gy**2 - 0.33) + cz * (gz**2 - 0.33))
+        log_field = log_field + 0.45 * (
+            cx * (gx**2 - 0.33) + cy * (gy**2 - 0.33) + cz * (gz**2 - 0.33)
+        )
     if order >= 3:
         log_field = log_field + 0.25 * (cx * gx * gy + cy * gy * gz + cz * gx * gz)
 
@@ -54,23 +58,37 @@ def apply_site_pre_profile(
     ctx: ScanContext,
     site: SiteProfileConfig,
 ) -> dict[str, Any]:
-    """Apply Stage SITE_PRE intrinsic scanner physics (contrast, PSF, static coil B1, scaling)."""
+    """Apply Stage SITE_PRE intrinsic scanner physics (or exact no-op if `site.passthrough`)."""
+    if site.passthrough:
+        return {
+            "site_id": site.site_id,
+            "passthrough": True,
+            "realized_gamma": 1.0,
+            "realized_gain": 1.0,
+            "realized_offset": 0.0,
+            "realized_psf_sigma": [0.0, 0.0, 0.0],
+            "realized_voxel_scale": [1.0, 1.0, 1.0],
+            "coil_count": site.coil_count,
+        }
+
+    # In coupled trajectory mode, draw site jitter from dedicated site_seed so site physics stay fixed
+    site_rng = np.random.default_rng(ctx.site_seed) if ctx.site_seed is not None else ctx.rng
+
     j = site.jitter_scale
-    gamma = float(np.clip(site.contrast_gamma * (1.0 + ctx.rng.normal(0.0, 0.25 * j)), 0.45, 2.2))
-    gain = float(np.clip(site.intensity_gain * (1.0 + ctx.rng.normal(0.0, 0.35 * j)), 0.4, 3.0))
-    offset = float(site.intensity_offset + ctx.rng.normal(0.0, 0.05 * j))
+    gamma = float(np.clip(site.contrast_gamma * (1.0 + site_rng.normal(0.0, 0.25 * j)), 0.45, 2.2))
+    gain = float(np.clip(site.intensity_gain * (1.0 + site_rng.normal(0.0, 0.35 * j)), 0.4, 3.0))
+    offset = float(site.intensity_offset + site_rng.normal(0.0, 0.05 * j))
     psf = tuple(
-        max(0.0, float(s * (1.0 + ctx.rng.normal(0.0, 0.25 * j)))) for s in site.psf_sigma_vox
+        max(0.0, float(s * (1.0 + site_rng.normal(0.0, 0.25 * j)))) for s in site.psf_sigma_vox
     )
     vox_scale = tuple(
-        float(np.clip(vs * (1.0 + ctx.rng.normal(0.0, 0.03 * j)), 0.96, 1.04))
+        float(np.clip(vs * (1.0 + site_rng.normal(0.0, 0.03 * j)), 0.96, 1.04))
         for vs in site.voxel_scale
     )
 
     arr = ctx.data.astype(np.float32, copy=True)
     ref_scale = max(ctx.priors.fg_p95, 1e-6)
 
-    # 1. Tissue contrast gamma transfer (via MONAI AdjustContrast on normalized positive signal)
     if abs(gamma - 1.0) > 1e-3:
         normed = np.clip(arr / ref_scale, 0.0, 2.5)
         t = torch.from_numpy(normed).to(ctx.torch_device)
@@ -81,20 +99,19 @@ def apply_site_pre_profile(
         else:
             arr = np.asarray(out_t, dtype=np.float32) * ref_scale
 
-    # 2. Scanner intensity gain & subtle pedestal offset (applied primarily to foreground+signal)
     arr = np.maximum(arr * gain + offset * ref_scale, 0.0)
 
-    # 3. Scanner reconstruction PSF (anisotropic smoothing kernel)
     if any(s > 0.05 for s in psf):
         if arr.ndim == 4:
             for t_idx in range(arr.shape[3]):
-                arr[..., t_idx] = ndimage.gaussian_filter(arr[..., t_idx], sigma=psf, mode="nearest")
+                arr[..., t_idx] = ndimage.gaussian_filter(
+                    arr[..., t_idx], sigma=psf, mode="nearest"
+                )
         else:
             arr = ndimage.gaussian_filter(arr, sigma=psf, mode="nearest")
 
-    # 4. Static head-coil B1 bias template with slight positioning jitter
     if any(abs(c) > 1e-4 for c in site.bias_coeffs):
-        bias_jitter = ctx.rng.normal(0.0, 0.15 * j, size=3)
+        bias_jitter = site_rng.normal(0.0, 0.15 * j, size=3)
         b1_field = _build_polynomial_bias(
             ctx.spatial_shape, site.bias_coeffs, site.bias_order, bias_jitter
         )
@@ -106,7 +123,6 @@ def apply_site_pre_profile(
         else:
             arr = arr * b1_field
 
-    # 5. Subtle gradient nonlinearity / voxel scaling bias
     if any(abs(vs - 1.0) > 2e-3 for vs in vox_scale):
         center = np.array(ctx.spatial_shape, dtype=np.float64) / 2.0
         inv_mat = np.diag([1.0 / vox_scale[0], 1.0 / vox_scale[1], 1.0 / vox_scale[2]])
@@ -117,12 +133,15 @@ def apply_site_pre_profile(
                     arr[..., t_idx], matrix=inv_mat, offset=shift, order=1, mode="nearest"
                 )
         else:
-            arr = ndimage.affine_transform(arr, matrix=inv_mat, offset=shift, order=1, mode="nearest")
+            arr = ndimage.affine_transform(
+                arr, matrix=inv_mat, offset=shift, order=1, mode="nearest"
+            )
 
     ctx.data = np.maximum(arr.astype(np.float32), 0.0)
 
     return {
         "site_id": site.site_id,
+        "passthrough": False,
         "realized_gamma": round(gamma, 4),
         "realized_gain": round(gain, 4),
         "realized_offset": round(offset, 4),
@@ -136,21 +155,36 @@ def apply_site_noise_floor(
     ctx: ScanContext,
     site: SiteProfileConfig,
 ) -> dict[str, Any]:
-    """Apply Stage NOISE_DRIFT site-specific coil noise floor + parallel-imaging g-factor."""
-    if site.noise_sigma_rel <= 0.0:
-        return {"site_noise_sigma_abs": 0.0, "coil_count": site.coil_count}
+    """Apply Stage NOISE_DRIFT site-specific coil noise floor (or exact no-op if `site.passthrough`)."""
+    if site.passthrough or site.noise_sigma_rel <= 0.0:
+        return {
+            "site_noise_sigma_rel": 0.0,
+            "site_noise_sigma_abs": 0.0,
+            "site_g_factor": 0.0,
+            "coil_count": site.coil_count,
+            "passthrough": site.passthrough,
+        }
+
+    site_rng = (
+        np.random.default_rng((ctx.site_seed + 17) % (2**31 - 1))
+        if ctx.site_seed is not None
+        else ctx.rng
+    )
 
     j = site.jitter_scale
-    sigma_rel = max(0.001, float(site.noise_sigma_rel * (1.0 + ctx.rng.normal(0.0, 0.20 * j))))
-    g_strength = max(0.0, float(site.g_factor_strength * (1.0 + ctx.rng.normal(0.0, 0.15 * j))))
+    sigma_rel = max(0.001, float(site.noise_sigma_rel * (1.0 + site_rng.normal(0.0, 0.20 * j))))
+    g_strength = max(
+        0.0, float(site.g_factor_strength * (1.0 + site_rng.normal(0.0, 0.15 * j)))
+    )
     sigma_abs = sigma_rel * ctx.priors.fg_median * site.intensity_gain
+    noise_seed = int(site_rng.integers(0, 2**31 - 1))
 
     ctx.data = apply_noncentral_chi_noise(
         ctx.data,
         sigma=sigma_abs,
         coil_count=site.coil_count,
         g_factor_strength=g_strength,
-        seed=ctx.spawn_seed(),
+        seed=noise_seed,
         device=ctx.torch_device,
     )
     return {
@@ -158,4 +192,5 @@ def apply_site_noise_floor(
         "site_noise_sigma_abs": round(sigma_abs, 5),
         "site_g_factor": round(g_strength, 4),
         "coil_count": site.coil_count,
+        "passthrough": False,
     }

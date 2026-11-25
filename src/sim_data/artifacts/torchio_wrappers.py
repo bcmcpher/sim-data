@@ -25,7 +25,6 @@ def _run_torchio_transform(
         tensor = torch.from_numpy(np.ascontiguousarray(data[None, ...], dtype=np.float32))
 
     image = tio.ScalarImage(tensor=tensor, affine=affine)
-    # Scope torch/numpy RNG state deterministically without disturbing caller RNG
     cpu_state = torch.random.get_rng_state()
     np_state = np.random.get_state()
     try:
@@ -53,7 +52,8 @@ class Motion3D(BaseArtifactTransform):
     def _apply_impl(self, ctx: ScanContext) -> dict[str, Any]:
         degrees = float(self.params.get("degrees", 1.5 + 11.5 * self.severity))
         translation = float(self.params.get("translation", 1.5 + 10.5 * self.severity))
-        num_transforms = int(self.params.get("num_transforms", max(2, int(round(2 + 5 * self.severity)))))
+        default_n = 4 if ctx.coupled_trajectory else max(2, int(round(2 + 5 * self.severity)))
+        num_transforms = int(self.params.get("num_transforms", default_n))
 
         tfm = tio.RandomMotion(
             degrees=degrees,
@@ -84,7 +84,8 @@ class Ghosting3D(BaseArtifactTransform):
 
     def _apply_impl(self, ctx: ScanContext) -> dict[str, Any]:
         axis = int(self.params.get("axis", ctx.pe_axis))
-        num_ghosts = int(self.params.get("num_ghosts", max(2, int(round(2 + 4 * self.severity)))))
+        default_g = 4 if ctx.coupled_trajectory else max(2, int(round(2 + 4 * self.severity)))
+        num_ghosts = int(self.params.get("num_ghosts", default_g))
         intensity = float(self.params.get("intensity", 0.20 + 1.05 * self.severity))
 
         tfm = tio.RandomGhosting(
@@ -116,7 +117,6 @@ class Anisotropy(BaseArtifactTransform):
     def _apply_impl(self, ctx: ScanContext) -> dict[str, Any]:
         axis = int(self.params.get("axis", ctx.slice_axis))
         downsampling = float(self.params.get("downsampling", 1.5 + 3.8 * self.severity))
-        # Clamp to avoid collapsing tiny volumes to <4 slices
         max_safe = max(1.5, ctx.spatial_shape[axis] / 8.0)
         downsampling = float(min(downsampling, max_safe))
 

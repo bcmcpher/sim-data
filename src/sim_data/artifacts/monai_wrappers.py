@@ -1,4 +1,4 @@
-"""MONAI-backed severity-calibrated MRI artifact transforms."""
+"""MONAI-backed severity-calibrated MRI artifact transforms with CRN coupling & real-scan noise calibration."""
 
 from __future__ import annotations
 
@@ -41,7 +41,6 @@ class GibbsRinging(BaseArtifactTransform):
     qc_weight = 0.85
 
     def _apply_impl(self, ctx: ScanContext) -> dict[str, Any]:
-        # MONAI GibbsNoise(alpha): alpha in [0, 1] is fraction of outer k-space removed
         alpha = float(self.params.get("alpha", 0.25 + 0.45 * self.severity))
         alpha = float(np.clip(alpha, 0.05, 0.80))
 
@@ -55,8 +54,8 @@ class GibbsRinging(BaseArtifactTransform):
 class RFSpike(BaseArtifactTransform):
     """K-space RF spike (herringbone striping) via MONAI KSpaceSpikeNoise.
 
-    For 3D structural scans, injects 1-3 controlled off-center spikes.
-    For 4D scans (BOLD/DWI), injects transient spikes into a random subset of volumes.
+    Pre-samples spike-location banks and 4D volume permutations once so coupled
+    trajectories produce strictly nested spikes/volumes with monotonically increasing amplitude.
     """
 
     name = "rf_spike"
@@ -64,11 +63,11 @@ class RFSpike(BaseArtifactTransform):
     supported_modalities = ("T1w", "T2w", "FLAIR", "bold", "dwi")
     qc_weight = 1.05
 
-    def _sample_spike_loc(self, shape: tuple[int, int, int], rng: np.random.Generator) -> tuple[int, int, int]:
+    def _sample_spike_loc(
+        self, shape: tuple[int, int, int], rng: np.random.Generator
+    ) -> tuple[int, int, int]:
         center = np.array(shape, dtype=np.float64) / 2.0
-        # Off-center radial band: 8% to 32% of half-extent produces clear herringbone fringes
         frac = rng.uniform(0.08, 0.32, size=3) * rng.choice([-1.0, 1.0], size=3)
-        # Ensure at least two axes have meaningful offset so striping is visible in all planes
         loc = np.round(center + frac * center).astype(int)
         loc = np.clip(loc, 2, np.array(shape) - 3)
         if np.all(np.abs(loc - center) < 2):
@@ -77,7 +76,7 @@ class RFSpike(BaseArtifactTransform):
 
     def _apply_impl(self, ctx: ScanContext) -> dict[str, Any]:
         n_spikes = int(self.params.get("num_spikes", max(1, int(round(1 + 2 * self.severity)))))
-        # MONAI KSpaceSpikeNoise uses natural log (ln) of k-space magnitude
+        max_bank = max(4, n_spikes)
         shape = ctx.spatial_shape
         ref_vol = ctx.data[..., 0] if ctx.is_4d else ctx.data
         fft_ref = np.abs(np.fft.fftn(ref_vol))
@@ -90,24 +89,30 @@ class RFSpike(BaseArtifactTransform):
         affected_volumes: list[int] = []
 
         if not ctx.is_4d:
+            bank = [self._sample_spike_loc(shape, ctx.rng) for _ in range(max_bank)]
+            locs = bank[:n_spikes]
             tensor, _ = _to_channel_first_tensor(ctx.data, ctx.torch_device)
-            locs = [self._sample_spike_loc(shape, ctx.rng) for _ in range(n_spikes)]
             loc_tuples = [(0, loc[0], loc[1], loc[2]) for loc in locs]
             tfm = KSpaceSpikeNoise(loc=loc_tuples, k_intensity=[k_intensity] * len(loc_tuples))
             out_spike = tfm(tensor)
             ctx.data = np.maximum(_from_channel_first_tensor(out_spike, False), 0.0)
         else:
             n_vols = ctx.data.shape[3]
+            vol_perm = ctx.rng.permutation(n_vols)
+            vol_banks = [
+                [self._sample_spike_loc(shape, ctx.rng) for _ in range(max_bank)]
+                for _ in range(n_vols)
+            ]
             frac_vols = float(self.params.get("volume_fraction", 0.12 + 0.45 * self.severity))
-            n_aff = max(1, int(round(n_vols * frac_vols)))
-            vol_indices = sorted(
-                int(i) for i in ctx.rng.choice(n_vols, size=min(n_aff, n_vols), replace=False)
-            )
+            n_aff = max(1, min(n_vols, int(round(n_vols * frac_vols))))
+            vol_indices = sorted(int(i) for i in vol_perm[:n_aff])
             affected_volumes = vol_indices
             out = ctx.data.copy()
             for v in vol_indices:
-                vol_t = torch.from_numpy(np.ascontiguousarray(out[None, ..., v])).to(ctx.torch_device)
-                v_locs = [self._sample_spike_loc(shape, ctx.rng) for _ in range(n_spikes)]
+                vol_t = torch.from_numpy(np.ascontiguousarray(out[None, ..., v])).to(
+                    ctx.torch_device
+                )
+                v_locs = vol_banks[v][:n_spikes]
                 if len(locs) < 6:
                     locs.extend(v_locs)
                 loc_tuples = [(0, loc[0], loc[1], loc[2]) for loc in v_locs]
@@ -116,6 +121,8 @@ class RFSpike(BaseArtifactTransform):
                 out[..., v] = np.maximum(_from_channel_first_tensor(vol_out, False), 0.0)
             ctx.data = out
 
+        ctx.metadata["gt_rf_spike_locs"] = locs
+        ctx.metadata["gt_rf_spike_volumes"] = affected_volumes
         return {
             "engine": "monai.KSpaceSpikeNoise",
             "num_spikes": n_spikes,
@@ -126,7 +133,12 @@ class RFSpike(BaseArtifactTransform):
 
 
 class BiasField(BaseArtifactTransform):
-    """Smooth 3D multiplicative B1 bias field via MONAI RandBiasField."""
+    """Smooth 3D multiplicative B1 bias field via MONAI RandBiasField.
+
+    Draws a unit-normalized 3D log-polynomial basis from the trajectory seed and scales its
+    amplitude monotonically with `severity` so spatial shading orientation stays locked across
+    coupled dose steps.
+    """
 
     name = "bias_field"
     stage = PipelineStage.BIAS_FIELD
@@ -135,29 +147,26 @@ class BiasField(BaseArtifactTransform):
 
     def _apply_impl(self, ctx: ScanContext) -> dict[str, Any]:
         degree = int(self.params.get("degree", 3))
-        # Symmetric polynomial coefficients avoid all-positive exponential blowup in MONAI RandBiasField
-        coeff = float(self.params.get("coeff_max", 0.14 + 0.34 * self.severity))
         seed = ctx.spawn_seed()
 
-        # Generate multiplicative field on a unit 3D volume so 4D shares an identical static B1 field
+        # Draw fixed-range polynomial basis independent of severity, then scale log-span monotonically
         ones = torch.ones((1, *ctx.spatial_shape), dtype=torch.float32, device=ctx.torch_device)
-        tfm = RandBiasField(degree=degree, coeff_range=(-coeff, coeff), prob=1.0)
+        tfm = RandBiasField(degree=degree, coeff_range=(-0.5, 0.5), prob=1.0)
         tfm.set_random_state(seed=seed)
-        field_3d = tfm(ones)[0].detach().cpu().numpy().astype(np.float32)
+        raw_field = tfm(ones)[0].detach().cpu().numpy().astype(np.float32)
 
-        # Ensure meaningful shading magnitude (rescaling log-field if random draw was near zero)
-        brain_log = np.log(np.clip(field_3d[ctx.priors.brain_mask], 1e-4, 1e4))
-        cur_span = float(np.percentile(brain_log, 95) - np.percentile(brain_log, 5))
-        target_min_span = 0.20 + 0.85 * self.severity
-        if cur_span > 1e-4 and cur_span < target_min_span:
-            scale = min(4.0, target_min_span / cur_span)
-            log_full = np.log(np.clip(field_3d, 1e-4, 1e4))
-            log_full = (log_full - float(np.median(brain_log))) * scale
-            field_3d = np.exp(np.clip(log_full, -1.6, 1.6)).astype(np.float32)
+        log_full = np.log(np.clip(raw_field, 1e-4, 1e4)).astype(np.float64)
+        brain_log = log_full[ctx.priors.brain_mask]
+        med_log = float(np.median(brain_log))
+        cur_span = float(np.percentile(brain_log, 95.0) - np.percentile(brain_log, 5.0))
+
+        target_span = float(self.params.get("target_log_span", 0.20 + 0.90 * self.severity))
+        if cur_span > 1e-4:
+            unit_log = (log_full - med_log) / cur_span
+            field_3d = np.exp(np.clip(unit_log * target_span, -1.6, 1.6)).astype(np.float32)
         else:
-            field_3d = np.clip(field_3d, 0.15, 6.0).astype(np.float32)
+            field_3d = np.clip(raw_field, 0.15, 6.0).astype(np.float32)
 
-        # Normalize median inside brain to ~1.0 so global scale isn't trivially collapsed
         brain_med = float(np.median(field_3d[ctx.priors.brain_mask]))
         if brain_med > 1e-4:
             field_3d = field_3d / brain_med
@@ -172,13 +181,17 @@ class BiasField(BaseArtifactTransform):
         return {
             "engine": "monai.RandBiasField",
             "degree": degree,
-            "coeff_max": round(coeff, 4),
+            "target_log_span": round(target_span, 4),
             "realized_brain_field_range": round(field_range, 4),
         }
 
 
 class RicianNoiseArtifact(BaseArtifactTransform):
-    """Magnitude MRI Rician (or multi-coil Non-Central Chi) noise degrading SNR."""
+    """Magnitude MRI Rician (or multi-coil Non-Central Chi) noise degrading SNR.
+
+    Supports `noise_calibration="excess_variance"` (default) to subtract pre-existing
+    native scanner noise sigma_0 in quadrature on real QC-passing scans, or `"additive"`.
+    """
 
     name = "rician_noise"
     stage = PipelineStage.NOISE_DRIFT
@@ -190,13 +203,21 @@ class RicianNoiseArtifact(BaseArtifactTransform):
 
         coil_count = int(self.params.get("coil_count", 1))
         g_factor_strength = float(self.params.get("g_factor_strength", 0.0))
-        # Relative sigma calibrated to clean foreground median
         sigma_rel = float(self.params.get("sigma_rel", 0.018 + 0.22 * (self.severity**1.2)))
-        sigma_abs = sigma_rel * ctx.priors.fg_median
+        sigma_target = sigma_rel * ctx.priors.fg_median
+
+        if ctx.noise_calibration == "excess_variance" and ctx.baseline_noise_sigma > 0.0:
+            excess_sq = sigma_target**2 - ctx.baseline_noise_sigma**2
+            if excess_sq > 0.0:
+                sigma_applied = float(np.sqrt(excess_sq))
+            else:
+                sigma_applied = float(0.15 * sigma_target)
+        else:
+            sigma_applied = float(sigma_target)
 
         if coil_count == 1 and g_factor_strength <= 0.0:
             tensor, was_4d = _to_channel_first_tensor(ctx.data, ctx.torch_device)
-            tfm = RandRicianNoise(prob=1.0, mean=0.0, std=sigma_abs, sample_std=False)
+            tfm = RandRicianNoise(prob=1.0, mean=0.0, std=sigma_applied, sample_std=False)
             tfm.set_random_state(seed=ctx.spawn_seed())
             out = tfm(tensor)
             ctx.data = np.maximum(_from_channel_first_tensor(out, was_4d), 0.0)
@@ -204,7 +225,7 @@ class RicianNoiseArtifact(BaseArtifactTransform):
         else:
             ctx.data = apply_noncentral_chi_noise(
                 ctx.data,
-                sigma=sigma_abs,
+                sigma=sigma_applied,
                 coil_count=coil_count,
                 g_factor_strength=g_factor_strength,
                 seed=ctx.spawn_seed(),
@@ -215,7 +236,10 @@ class RicianNoiseArtifact(BaseArtifactTransform):
         return {
             "engine": engine,
             "sigma_rel": round(sigma_rel, 5),
-            "sigma_abs": round(sigma_abs, 5),
+            "sigma_target_abs": round(sigma_target, 5),
+            "sigma_abs": round(sigma_applied, 5),
+            "baseline_noise_sigma": round(ctx.baseline_noise_sigma, 5),
+            "noise_calibration": ctx.noise_calibration,
             "coil_count": coil_count,
             "g_factor_strength": round(g_factor_strength, 3),
         }

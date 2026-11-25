@@ -14,6 +14,7 @@ dependencies = [
     "scipy>=1.11.0",
     "nibabel>=5.2.0",
     "dipy>=1.9.0",
+    "SimpleITK>=2.3.0",
     "torchio>=0.20.0",
     "monai>=1.4.0",
     "pydantic>=2.6.0",
@@ -112,7 +113,6 @@ module = [
     "monai.*",
     "joblib.*",
     "combatlearn.*",
-    "neuroCombat.*",
     "pandas.*",
     "matplotlib.*",
 ]

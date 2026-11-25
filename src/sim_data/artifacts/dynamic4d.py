@@ -30,11 +30,9 @@ def compute_power_fd(
 class Motion4D(BaseArtifactTransform):
     """Inter-volume 6-DOF head motion trajectory for 4D BOLD and DWI.
 
-    - Simulates AR(1) slow head drift + abrupt Poisson head jerks.
-    - Computes exact ground-truth Power FD (radius=50 mm).
-    - Injects spin-history intensity transients on high-FD frames (BOLD).
-    - Preserves DWI .bvec UNROTATED by default (raw observed data), with optional
-      rotate_bvecs=True to simulate preprocessed/corrected gradient tables.
+    Uses Common-Random-Numbers (CRN) pre-sampled latent drift & jerk arrays so increasing
+    `severity` along a coupled trajectory preserves exact jerk timing/direction while
+    monotonically scaling motion amplitude and Power FD.
     """
 
     name = "motion_4d"
@@ -50,7 +48,6 @@ class Motion4D(BaseArtifactTransform):
         zooms = np.array(ctx.zooms, dtype=np.float64)
         center = np.array(ctx.spatial_shape, dtype=np.float64) / 2.0
 
-        # Scale drift & spike magnitudes smoothly with severity
         drift_trans_std = float(self.params.get("drift_trans_mm", 0.08 + 0.55 * self.severity))
         drift_rot_deg = float(self.params.get("drift_rot_deg", 0.08 + 0.55 * self.severity))
         spike_prob = float(self.params.get("spike_prob", 0.04 + 0.20 * self.severity))
@@ -58,17 +55,25 @@ class Motion4D(BaseArtifactTransform):
         spike_rot_deg = float(self.params.get("spike_rot_deg", 0.4 + 2.5 * self.severity))
         rotate_bvecs = bool(self.params.get("rotate_bvecs", ctx.rotate_dwi_bvecs))
 
+        # Pre-sample fixed-shape latent arrays once so CRN trajectories are strictly nested & monotone
+        u_drift_trans = ctx.rng.normal(0.0, 1.0, size=(n_t, 3))
+        u_drift_rot = ctx.rng.normal(0.0, 1.0, size=(n_t, 3))
+        u_spike_trigger = ctx.rng.random(size=n_t)
+        u_spike_trans = ctx.rng.normal(0.0, 1.0, size=(n_t, 3))
+        u_spike_rot = ctx.rng.normal(0.0, 1.0, size=(n_t, 3))
+        u_spin_sign = ctx.rng.choice([-1.0, 1.0], size=n_t)
+
         trans_mm = np.zeros((n_t, 3), dtype=np.float64)
         rot_deg = np.zeros((n_t, 3), dtype=np.float64)
+        spike_frames: list[int] = []
 
         for t in range(1, n_t):
-            # AR(1) smooth drift
-            trans_mm[t] = 0.85 * trans_mm[t - 1] + ctx.rng.normal(0.0, drift_trans_std, size=3)
-            rot_deg[t] = 0.85 * rot_deg[t - 1] + ctx.rng.normal(0.0, drift_rot_deg, size=3)
-            # Abrupt head jerk / cough
-            if ctx.rng.random() < spike_prob:
-                trans_mm[t] += ctx.rng.normal(0.0, spike_trans_mm, size=3)
-                rot_deg[t] += ctx.rng.normal(0.0, spike_rot_deg, size=3)
+            trans_mm[t] = 0.85 * trans_mm[t - 1] + drift_trans_std * u_drift_trans[t]
+            rot_deg[t] = 0.85 * rot_deg[t - 1] + drift_rot_deg * u_drift_rot[t]
+            if float(u_spike_trigger[t]) < spike_prob:
+                trans_mm[t] += spike_trans_mm * u_spike_trans[t]
+                rot_deg[t] += spike_rot_deg * u_spike_rot[t]
+                spike_frames.append(t)
 
         rot_rad = np.deg2rad(rot_deg)
         fd = compute_power_fd(trans_mm, rot_rad, radius_mm=50.0)
@@ -78,7 +83,6 @@ class Motion4D(BaseArtifactTransform):
 
         for t in range(n_t):
             rot_mat = Rotation.from_euler("xyz", rot_rad[t]).as_matrix()
-            # Convert mm translation to voxel coordinates
             trans_vox = trans_mm[t] / np.maximum(zooms, 1e-3)
             inv_rot = rot_mat.T
             offset = center - inv_rot @ center - inv_rot @ trans_vox
@@ -87,11 +91,10 @@ class Motion4D(BaseArtifactTransform):
                 ctx.data[..., t], matrix=inv_rot, offset=offset, order=1, mode="nearest"
             )
 
-            # Spin-history intensity transient on high-FD volumes (especially BOLD)
+            # Spin-history intensity transient on high-FD volumes (BOLD)
             if t > 0 and fd[t] > 0.25 and ctx.modality == "bold":
                 spin_amp = float(np.clip(0.04 * fd[t], 0.0, 0.22))
-                sign = float(ctx.rng.choice([-1.0, 1.0]))
-                # Alternating odd/even slice modulation mimics interleaved spin-history excitation
+                sign = float(u_spin_sign[t])
                 vol = vol.copy()
                 vol[:, :, ::2] *= 1.0 + sign * spin_amp
                 vol[:, :, 1::2] *= 1.0 - 0.5 * sign * spin_amp
@@ -99,7 +102,6 @@ class Motion4D(BaseArtifactTransform):
             out[..., t] = vol
 
             if new_bvecs is not None and new_bvecs.shape == (3, n_t):
-                # Rotate gradient vector only when simulating preprocessed/motion-corrected data
                 bvec = new_bvecs[:, t]
                 norm = float(np.linalg.norm(bvec))
                 if norm > 1e-4:
@@ -110,8 +112,8 @@ class Motion4D(BaseArtifactTransform):
         if new_bvecs is not None:
             ctx.bvecs = new_bvecs.astype(np.float32)
 
-        # Store ground-truth FD series for downstream NiPreps-aligned metrics and carpet plots
         ctx.metadata["gt_fd_timeseries"] = [round(float(x), 4) for x in fd]
+        ctx.metadata["gt_spike_frames"] = spike_frames
         ctx.metadata["gt_max_rel_translation"] = float(
             np.max(np.linalg.norm(np.diff(trans_mm, axis=0), axis=1)) if n_t > 1 else 0.0
         )
@@ -127,12 +129,18 @@ class Motion4D(BaseArtifactTransform):
             "fd_max_mm": round(float(np.max(fd)), 4),
             "fd_num_gt_02": fd_gt_02,
             "fd_perc_gt_02": round(100.0 * fd_gt_02 / max(1, n_t), 2),
+            "n_spike_frames": len(spike_frames),
             "rotate_bvecs": rotate_bvecs,
         }
 
 
 class DWISliceDropout(BaseArtifactTransform):
-    """Intra-TR diffusion signal dropout ('venetian blind' / dark slices) on high-b DWI volumes."""
+    """Intra-TR diffusion signal dropout ('venetian blind' / dark slices) on high-b DWI volumes.
+
+    Pre-samples volume/slice priority permutations and unit attenuation uniforms once per
+    trajectory so increasing `severity` produces strictly nested dropped-slice sets and
+    monotonically darker signal attenuation.
+    """
 
     name = "dwi_slice_dropout"
     stage = PipelineStage.SPATIAL_FIELD_4D
@@ -150,32 +158,38 @@ class DWISliceDropout(BaseArtifactTransform):
         if valid_slices.size == 0:
             valid_slices = np.arange(ctx.spatial_shape[sl_axis])
 
-        bvals = ctx.bvals if (ctx.bvals is not None and len(ctx.bvals) == n_vols) else np.full(n_vols, 1000.0)
+        bvals = (
+            ctx.bvals
+            if (ctx.bvals is not None and len(ctx.bvals) == n_vols)
+            else np.full(n_vols, 1000.0)
+        )
         high_b_idx = np.where(bvals > 150.0)[0]
         if high_b_idx.size == 0:
             high_b_idx = np.arange(n_vols)
 
-        # Fraction of high-b volumes affected & slices per affected volume
-        vol_frac = float(self.params.get("volume_fraction", 0.12 + 0.50 * self.severity))
-        n_aff_vols = max(1, int(round(high_b_idx.size * vol_frac)))
-        aff_vols = sorted(
-            int(v)
-            for v in ctx.rng.choice(high_b_idx, size=min(n_aff_vols, high_b_idx.size), replace=False)
-        )
+        # Pre-sample nested volume order, per-volume slice orders, and unit attenuation uniforms
+        vol_perm = ctx.rng.permutation(high_b_idx)
+        slice_perms: dict[int, np.ndarray] = {}
+        u_attens: dict[int, np.ndarray] = {}
+        for v_raw in high_b_idx:
+            v_int = int(v_raw)
+            slice_perms[v_int] = ctx.rng.permutation(valid_slices)
+            u_attens[v_int] = ctx.rng.random(size=valid_slices.size)
 
-        # Attenuation factor: near-zero black slices at high severity
+        vol_frac = float(self.params.get("volume_fraction", 0.12 + 0.50 * self.severity))
+        n_aff_vols = max(1, min(high_b_idx.size, int(round(high_b_idx.size * vol_frac))))
+        aff_vols = sorted(int(v) for v in vol_perm[:n_aff_vols])
+
         min_atten = float(self.params.get("min_attenuation", max(0.03, 0.40 - 0.36 * self.severity)))
         max_atten = float(self.params.get("max_attenuation", max(0.10, 0.55 - 0.35 * self.severity)))
+        n_slices_drop = max(1, min(valid_slices.size, int(round(1 + 3 * self.severity))))
 
         out = ctx.data.copy()
         dropped_pairs: list[tuple[int, int]] = []
         for v in aff_vols:
-            n_slices_drop = max(1, int(round(1 + 3 * self.severity * float(ctx.rng.uniform(0.5, 1.3)))))
-            chosen_slices = ctx.rng.choice(
-                valid_slices, size=min(n_slices_drop, valid_slices.size), replace=False
-            )
-            for z in chosen_slices:
-                atten = float(ctx.rng.uniform(min_atten, max_atten))
+            chosen_slices = slice_perms[v][:n_slices_drop]
+            for s_pos, z in enumerate(chosen_slices):
+                atten = float(min_atten + u_attens[v][s_pos] * max(0.0, max_atten - min_atten))
                 sel: list[Any] = [slice(None), slice(None), slice(None), v]
                 sel[sl_axis] = int(z)
                 out[tuple(sel)] *= atten
@@ -184,6 +198,7 @@ class DWISliceDropout(BaseArtifactTransform):
         ctx.data = out
         total_brain_slices = max(1, int(valid_slices.size * high_b_idx.size))
         ctx.metadata["gt_dropped_slices_count"] = len(dropped_pairs)
+        ctx.metadata["gt_dropped_pairs"] = dropped_pairs
         return {
             "engine": "custom.DWISliceDropout",
             "slice_axis": sl_axis,

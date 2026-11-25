@@ -6,11 +6,14 @@ from pathlib import Path
 from typing import Any, Literal
 
 import yaml
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 Modality = Literal["T1w", "T2w", "FLAIR", "bold", "dwi"]
 SamplingMode = Literal["dose_response", "combinatorial", "multisite_factorial"]
 SiteNaming = Literal["desc", "none"]
+NamingScheme = Literal["blinded", "acq_blinded", "unblinded_validation"]
+NoiseCalibrationMode = Literal["excess_variance", "additive"]
+ContrastBackend = Literal["pchip_bloch"]
 
 
 def _default_modalities() -> list[Modality]:
@@ -27,6 +30,7 @@ class ArtifactSpec(BaseModel):
     name: str
     weight: float = Field(default=1.0, gt=0.0)
     severity_range: tuple[float, float] | None = None
+    fixed_severity: float | None = Field(default=None, ge=0.0, le=1.0)
     params: dict[str, Any] = Field(default_factory=dict)
 
     @field_validator("severity_range")
@@ -41,11 +45,28 @@ class ArtifactSpec(BaseModel):
         return value
 
 
+class CompoundTrajectorySpec(BaseModel):
+    """Multi-artifact coupled trajectory swept along a shared dose curve.
+
+    Each member ArtifactSpec scales as `clip(dose * weight, 0, 1)` unless
+    `fixed_severity` is set (which holds that artifact constant as a background
+    nuisance confounder across the trajectory).
+    """
+
+    name: str
+    artifacts: list[ArtifactSpec] = Field(default_factory=list)
+
+
 class SiteProfileConfig(BaseModel):
-    """Image-domain scanner physics profile inducing location, scale, and covariance effects."""
+    """Image-domain scanner physics profile inducing location, scale, and covariance effects.
+
+    Set `passthrough=True` for native real-scanner baselines where `severity=0.0` must
+    remain bit-for-bit identical to the input QC-passing scan.
+    """
 
     site_id: str
     description: str = ""
+    passthrough: bool = False
     contrast_gamma: float = Field(default=1.0, gt=0.2, lt=3.0)
     intensity_gain: float = Field(default=1.0, gt=0.2, lt=5.0)
     intensity_offset: float = Field(default=0.0, ge=-0.25, le=0.25)
@@ -81,6 +102,11 @@ class SamplingPlanConfig(BaseModel):
     include_clean_baseline: bool = True
     shuffle_run_order: bool = True
     dose_severities: list[float] = Field(default_factory=lambda: [0.0, 0.25, 0.55, 0.85])
+    coupled_trajectories: bool = True
+    replicates_per_artifact: int = Field(default=1, ge=1)
+    sweep_all_sites: bool = True
+    noise_calibration: NoiseCalibrationMode = "excess_variance"
+    compound_trajectories: list[CompoundTrajectorySpec] = Field(default_factory=list)
     samples_per_scan: int = Field(default=4, ge=1)
     samples_per_scan_per_site: int = Field(default=2, ge=1)
     min_artifacts: int = Field(default=1, ge=0)
@@ -91,17 +117,24 @@ class SamplingPlanConfig(BaseModel):
 
 
 class OutputConfig(BaseModel):
-    """Controls blinded BIDS outputs and optional downstream diagnostics.
+    """Controls BIDS outputs, blinding scheme, and optional downstream diagnostics.
 
-    By default, `sim-data generate` writes only blinded BIDS NIfTI/JSON/bval/bvec files,
-    BIDS root metadata (dataset_description.json, participants.tsv, *_scans.tsv, .bidsignore),
-    and the official ground-truth `manifest.tsv`. IQM extraction, 2D view rendering,
-    packet.json assembly, and categorical proxy QC labels are opt-in.
+    Naming schemes:
+    - `blinded` (default): Shuffled sequential `run-01..run-N` (+ optional `desc-<Site>`).
+      Zero artifact or severity leakage in filenames, JSON sidecars, or `*_scans.tsv`.
+    - `acq_blinded`: Raw-BIDS compliant (`DatasetType: "raw"`, no `desc-`) with shuffled
+      opaque `acq-v01..acq-vNN` labels. Zero artifact or severity leakage anywhere in the
+      BIDS tree; only `manifest.tsv` maps `acq-vXX` to trajectory and severity.
+    - `unblinded_validation` (explicit opt-in ONLY): Readable `acq-<Artifact>` and monotonic
+      `run-<Step>` labels strictly for internal debugging/validation where blinding is not
+      needed. NEVER use for human or AI QC rating studies because filenames leak severity.
     """
 
     save_nifti: bool = True
     write_bids_metadata: bool = True
     site_naming: SiteNaming = "desc"
+    naming_scheme: NamingScheme = "blinded"
+    include_severity_in_acq: bool = False
     extract_iqms: bool = False
     render_views: bool = False
     render_midline: bool = True
@@ -110,6 +143,16 @@ class OutputConfig(BaseModel):
     write_packets: bool = False
     include_proxy_qc_labels: bool = False
     qc_thresholds: QCThresholdConfig = Field(default_factory=QCThresholdConfig)
+
+    @model_validator(mode="after")
+    def _validate_blinding_guardrails(self) -> OutputConfig:
+        if self.include_severity_in_acq and self.naming_scheme != "unblinded_validation":
+            raise ValueError(
+                "include_severity_in_acq=True is only allowed when "
+                "naming_scheme='unblinded_validation'. Severity must never appear in "
+                "filenames under blinded or acq_blinded modes."
+            )
+        return self
 
 
 class SimulationConfig(BaseModel):
@@ -145,15 +188,32 @@ class DiffeomorphicWarpConfig(BaseModel):
 
 
 class OptionalTemplateConfig(BaseModel):
-    """Optional external NIfTI templates/priors (all None by default for template-free mode)."""
+    """Optional external NIfTI templates/masks (all None by default for template-free mode)."""
 
+    brain_mask_nifti: Path | None = None
     tissue_pve_nifti: Path | None = None
     rsn_parcellation_nifti: Path | None = None
     dti_eigenvector_nifti: Path | None = None
 
 
+class ContrastConversionConfig(BaseModel):
+    """Tissue-aware continuous T1w -> T2w / EPI contrast conversion parameters.
+
+    `backend="pchip_bloch"` implements Options 1 + 2 (N4ITK + ICV/external mask +
+    monotone decreasing PCHIP transfer anchored to Bloch tissue signals).
+    Reserved extension hook for a future pretrained neural backend (Option 3).
+    """
+
+    backend: ContrastBackend = "pchip_bloch"
+    n4_bias_correct: bool = True
+    preserve_micro_texture: bool = True
+    fat_retention_t2w: float = Field(default=0.65, ge=0.0, le=1.2)
+    fat_retention_epi: float = Field(default=0.12, ge=0.0, le=1.0)
+    brain_mask_suffix: str = "desc-brain_mask"
+
+
 class StructuralSynthesisConfig(BaseModel):
-    """Forward Bloch structural contrast synthesis parameters."""
+    """Forward Bloch / contrast-converted structural synthesis parameters."""
 
     preserve_seed_texture_weight: float = Field(default=0.65, ge=0.0, le=1.0)
     tissue_param_jitter: float = Field(default=0.06, ge=0.0, le=0.25)
@@ -192,9 +252,11 @@ class CohortSynthesisConfig(BaseModel):
     n_subjects: int = Field(default=12, ge=1)
     min_seed_subjects: int = Field(default=3, ge=1)
     allow_few_seeds: bool = False
+    preserve_real_modalities: bool = False
     modalities: list[Modality] = Field(default_factory=_default_modalities)
     warp: DiffeomorphicWarpConfig = Field(default_factory=DiffeomorphicWarpConfig)
     templates: OptionalTemplateConfig = Field(default_factory=OptionalTemplateConfig)
+    contrast: ContrastConversionConfig = Field(default_factory=ContrastConversionConfig)
     structural: StructuralSynthesisConfig = Field(default_factory=StructuralSynthesisConfig)
     bold: BoldSynthesisConfig = Field(default_factory=BoldSynthesisConfig)
     dwi: DwiSynthesisConfig = Field(default_factory=DwiSynthesisConfig)

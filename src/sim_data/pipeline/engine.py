@@ -15,15 +15,17 @@ from sim_data.artifacts.registry import ARTIFACT_REGISTRY, create_artifact
 from sim_data.config import SimulationConfig
 from sim_data.io.bids import (
     BIDSScan,
-    build_blinded_bids_stem,
+    build_output_bids_stem,
     discover_bids_scans,
     load_bids_scan,
     write_bids_root_files,
     write_bids_scan,
 )
 from sim_data.io.orientation import (
-    canonicalize_to_ras,
+    canonicalize_to_ras_with_transform,
     compute_anatomical_priors,
+    estimate_background_noise_sigma,
+    reorient_bvecs_to_ras,
     resolve_encoding_axes,
 )
 from sim_data.iqm.extractor import extract_iqms
@@ -55,12 +57,20 @@ def simulate_single_recipe(
     out_dir: str | Path,
     device: str = "auto",
 ) -> dict[str, Any]:
-    """Execute the strict 7-stage physical causal pipeline for one blinded ScanRecipe."""
+    """Execute the strict 7-stage physical causal pipeline for one ScanRecipe."""
     out_root = Path(out_dir)
     loaded = load_bids_scan(recipe.scan)
-    clean_data, affine, zooms = canonicalize_to_ras(loaded.img)
-    pe_axis, ro_axis, sl_axis = resolve_encoding_axes(loaded.sidecar, recipe.scan.modality)
+    clean_data, affine, zooms, ornt_transform = canonicalize_to_ras_with_transform(loaded.img)
+    pe_axis, ro_axis, sl_axis = resolve_encoding_axes(
+        loaded.sidecar, recipe.scan.modality, ornt_transform=ornt_transform
+    )
+    bvecs_ras = (
+        reorient_bvecs_to_ras(loaded.bvecs, ornt_transform) if loaded.bvecs is not None else None
+    )
     clean_priors = compute_anatomical_priors(clean_data, bvals=loaded.bvals)
+    baseline_sigma = estimate_background_noise_sigma(
+        clean_data, clean_priors.bg_mask, modality=recipe.scan.modality, bvals=loaded.bvals
+    )
 
     rng = np.random.default_rng(recipe.seed)
     ctx = ScanContext(
@@ -76,8 +86,12 @@ def simulate_single_recipe(
         seed=recipe.seed,
         device=device,
         bvals=loaded.bvals.copy() if loaded.bvals is not None else None,
-        bvecs=loaded.bvecs.copy() if loaded.bvecs is not None else None,
+        bvecs=bvecs_ras.copy() if bvecs_ras is not None else None,
         rotate_dwi_bvecs=recipe.rotate_dwi_bvecs,
+        coupled_trajectory=recipe.coupled_trajectory,
+        baseline_noise_sigma=baseline_sigma,
+        noise_calibration=config.sampling.noise_calibration,
+        site_seed=recipe.site_seed,
     )
 
     transforms = [create_artifact(a.name, a.severity, a.params) for a in recipe.artifacts]
@@ -89,7 +103,7 @@ def simulate_single_recipe(
 
     records: list[ArtifactRecord] = []
 
-    # Stage 2: Intrinsic site physics
+    # Stage 2: Intrinsic site physics (no-op if site.passthrough=True)
     site_pre_meta = apply_site_pre_profile(ctx, recipe.site)
 
     # Stages 3, 4, 5: Spatial/Field/4D -> K-Space -> Artifact Bias Field
@@ -112,7 +126,6 @@ def simulate_single_recipe(
     )
     fidelity = compute_fidelity_metrics(clean_data, ctx.data, clean_priors=clean_priors)
 
-    # Strictly blind image-only IQMs (only computed if explicitly opted in)
     iqms: dict[str, float] = {}
     if config.output.extract_iqms:
         iqms = extract_iqms(
@@ -125,11 +138,13 @@ def simulate_single_recipe(
         )
 
     site_for_name = recipe.site.site_id if config.sites else None
-    _rel_dir, stem = build_blinded_bids_stem(
+    _rel_dir, stem = build_output_bids_stem(
         recipe.scan,
         run_index=recipe.run_index,
         site_id=site_for_name,
         site_naming=config.output.site_naming,
+        naming_scheme=config.output.naming_scheme,
+        acq_label=recipe.acq_label,
     )
     scan_id = stem
 
@@ -146,6 +161,8 @@ def simulate_single_recipe(
             sidecar=loaded.sidecar,
             bvals=ctx.bvals,
             bvecs=ctx.bvecs,
+            naming_scheme=config.output.naming_scheme,
+            acq_label=recipe.acq_label,
         )
         nifti_rel_path = str(written["nifti"].relative_to(out_root))
 
@@ -170,6 +187,8 @@ def simulate_single_recipe(
             **defect_summary,
             "fidelity": fidelity,
             "site_id": recipe.site.site_id,
+            "trajectory_id": recipe.trajectory_id,
+            "dose_level": recipe.dose_level,
             "rotate_dwi_bvecs": recipe.rotate_dwi_bvecs,
             "artifacts": [
                 {"name": r.name, "severity": r.severity, "params": r.params}
@@ -189,15 +208,24 @@ def simulate_single_recipe(
         pkt_path = write_qc_packet(packet, out_root)
         packet_rel_path = str(pkt_path.relative_to(out_root))
 
-    # Build official ground-truth manifest row (the sole ledger of injected weights & site physics)
     psf_real = site_pre_meta.get("realized_psf_sigma", [0.0, 0.0, 0.0])
     row: dict[str, Any] = {
         "scan_id": scan_id,
         "subject": recipe.scan.subject,
         "session": recipe.scan.session or "",
-        "run": f"{recipe.run_index:02d}",
+        "acq_label": recipe.acq_label or "",
+        "run": f"{recipe.run_index:02d}" if recipe.run_index > 0 else "",
         "modality": recipe.scan.modality,
         "site_id": recipe.site.site_id,
+        "site_passthrough": bool(recipe.site.passthrough),
+        "trajectory_id": recipe.trajectory_id,
+        "target_artifact": recipe.target_artifact,
+        "replicate": recipe.replicate,
+        "dose_step": recipe.dose_step,
+        "dose_level": round(float(recipe.dose_level), 4),
+        "_baseline_recipe_key": recipe.baseline_recipe_key,
+        "baseline_scan_id": "",
+        "baseline_noise_sigma": round(float(baseline_sigma), 5),
         "seed": recipe.seed,
         "source_nifti": str(recipe.scan.nifti_path),
         "nifti_path": nifti_rel_path or "",
@@ -246,7 +274,7 @@ def run_simulation_plan(
     manifest_out: str | Path | None = None,
     scans_override: list[BIDSScan] | None = None,
 ) -> SimulationResult:
-    """Discover BIDS scans, expand blinded recipes, simulate in parallel, and write manifest.tsv."""
+    """Discover BIDS scans, expand recipes, simulate in parallel, and write manifest.tsv."""
     scans = (
         scans_override
         if scans_override is not None
@@ -271,10 +299,23 @@ def run_simulation_plan(
             delayed(simulate_single_recipe)(r, config, out_root, device) for r in recipes
         )
 
+    # Link every trajectory step to its shared s=0 baseline scan_id
+    baseline_map: dict[str, str] = {}
+    for row in rows:
+        bkey = str(row.get("_baseline_recipe_key", ""))
+        if bkey and row.get("target_artifact") == "baseline":
+            baseline_map[bkey] = str(row["scan_id"])
+    for row in rows:
+        bkey = str(row.pop("_baseline_recipe_key", ""))
+        row["baseline_scan_id"] = baseline_map.get(bkey, "")
+
     bids_root_files: dict[str, Path] = {}
     if config.output.write_bids_metadata:
         bids_root_files = write_bids_root_files(
-            out_root, rows=rows, site_naming=config.output.site_naming
+            out_root,
+            rows=rows,
+            site_naming=config.output.site_naming,
+            naming_scheme=config.output.naming_scheme,
         )
 
     manifest_target = Path(manifest_out) if manifest_out is not None else out_root / "manifest.tsv"

@@ -1,4 +1,4 @@
-"""RAS+ canonicalization, encoding axis resolution, and clean anatomical priors."""
+"""RAS+ canonicalization, encoding axis & bvec remapping, noise estimation, and anatomical priors."""
 
 from __future__ import annotations
 
@@ -7,6 +7,7 @@ from typing import Any
 
 import nibabel as nib
 import numpy as np
+from dipy.denoise.noise_estimate import estimate_sigma, piesno
 from dipy.segment.mask import median_otsu
 from scipy import ndimage
 from skimage.filters import threshold_otsu
@@ -27,45 +28,142 @@ class AnatomicalPriors:
     bg_std: float
 
 
-def canonicalize_to_ras(img: nib.Nifti1Image) -> tuple[np.ndarray, np.ndarray, tuple[float, float, float]]:
-    """Reorient a NIfTI image to closest RAS+ canonical orientation and return float32 data."""
+def canonicalize_to_ras_with_transform(
+    img: nib.Nifti1Image,
+) -> tuple[np.ndarray, np.ndarray, tuple[float, float, float], np.ndarray]:
+    """Reorient a NIfTI image to closest RAS+ orientation and return its orientation transform.
+
+    Returns `(data, affine, zooms, ornt_transform)` where `ornt_transform` is the `(3, 2)`
+    array from `nib.orientations.io_orientation(img.affine)` mapping each original voxel axis
+    to `(ras_axis, polarity_sign)`.
+    """
+    ornt_transform = np.asarray(nib.orientations.io_orientation(img.affine), dtype=np.float64)
     ras_img = nib.as_closest_canonical(img)
     data = np.asarray(ras_img.get_fdata(dtype=np.float32), dtype=np.float32)
     affine = np.asarray(ras_img.affine, dtype=np.float64)
     raw_zooms = ras_img.header.get_zooms()
     zooms = (float(raw_zooms[0]), float(raw_zooms[1]), float(raw_zooms[2]))
+    return data, affine, zooms, ornt_transform
+
+
+def canonicalize_to_ras(
+    img: nib.Nifti1Image,
+) -> tuple[np.ndarray, np.ndarray, tuple[float, float, float]]:
+    """Reorient a NIfTI image to closest RAS+ canonical orientation and return float32 data."""
+    data, affine, zooms, _ = canonicalize_to_ras_with_transform(img)
     return data, affine, zooms
+
+
+def reorient_bvecs_to_ras(
+    bvecs: np.ndarray,
+    ornt_transform: np.ndarray,
+) -> np.ndarray:
+    """Remap voxel-space FSL/BIDS `(3, N)` gradient vectors into canonical RAS+ voxel axes."""
+    arr = np.asarray(bvecs, dtype=np.float32)
+    if arr.ndim != 2 or arr.shape[0] != 3:
+        return arr.copy()
+    out = np.empty_like(arr, dtype=np.float32)
+    for in_ax in range(3):
+        out_ax = int(ornt_transform[in_ax, 0])
+        flip = float(ornt_transform[in_ax, 1])
+        out[out_ax, :] = flip * arr[in_ax, :]
+    return np.ascontiguousarray(out, dtype=np.float32)
 
 
 def resolve_encoding_axes(
     sidecar: dict[str, Any] | None,
     modality: str,
+    ornt_transform: np.ndarray | None = None,
 ) -> tuple[int, int, int]:
     """Resolve (phase_encode_axis, readout_axis, slice_axis) in RAS+ coordinates.
 
+    When `ornt_transform` (from `canonicalize_to_ras_with_transform`) is supplied,
+    sidecar `PhaseEncodingDirection` and `SliceEncodingDirection` (which refer to
+    original voxel axes before RAS+ canonicalization) are remapped into RAS+ axes.
     Returns integer indices in {0 (R-L), 1 (A-P), 2 (S-I)}.
     """
     sidecar = sidecar or {}
     axis_map = {"i": 0, "i-": 0, "j": 1, "j-": 1, "k": 2, "k-": 2}
 
+    def _map_axis(orig_ax: int) -> int:
+        if ornt_transform is not None and ornt_transform.shape == (3, 2):
+            return int(ornt_transform[orig_ax, 0])
+        return orig_ax
+
     pe_raw = str(sidecar.get("PhaseEncodingDirection", "")).strip().lower()
     sl_raw = str(sidecar.get("SliceEncodingDirection", "")).strip().lower()
 
     if pe_raw in axis_map:
-        pe_axis = axis_map[pe_raw]
+        pe_axis = _map_axis(axis_map[pe_raw])
     elif modality in ("bold", "dwi"):
         pe_axis = 1  # Anterior-Posterior standard for EPI
     else:
         pe_axis = 1  # AP default for structural
 
-    if sl_raw in axis_map and axis_map[sl_raw] != pe_axis:
-        slice_axis = axis_map[sl_raw]
+    if sl_raw in axis_map:
+        mapped_sl = _map_axis(axis_map[sl_raw])
+        slice_axis = mapped_sl if mapped_sl != pe_axis else (2 if pe_axis != 2 else 0)
     else:
         slice_axis = 2 if pe_axis != 2 else 0
 
     readout_candidates = [ax for ax in (0, 1, 2) if ax not in (pe_axis, slice_axis)]
     readout_axis = readout_candidates[0]
     return pe_axis, readout_axis, slice_axis
+
+
+def estimate_background_noise_sigma(
+    data: np.ndarray,
+    bg_mask: np.ndarray,
+    modality: str,
+    bvals: np.ndarray | None = None,
+) -> float:
+    """Estimate native single-volume background noise sigma_0 on a clean input scan.
+
+    Used by `excess_variance` noise calibration so real QC-passing scans (which already
+    contain scanner thermal/coil noise) degrade consistently alongside simulated scans.
+    """
+    arr = np.nan_to_num(np.asarray(data, dtype=np.float32), nan=0.0, posinf=0.0, neginf=0.0)
+
+    if modality == "dwi" and arr.ndim == 4:
+        try:
+            p_sig = np.asarray(piesno(arr, N=1, return_mask=False), dtype=np.float64)
+            pos_sig = p_sig[np.isfinite(p_sig) & (p_sig > 1e-4)]
+            if pos_sig.size > 0:
+                return float(np.median(pos_sig))
+        except Exception:
+            pass
+        try:
+            est = np.asarray(estimate_sigma(arr, N=1), dtype=np.float64)
+            pos_est = est[np.isfinite(est) & (est > 1e-4)]
+            if pos_est.size > 0:
+                return float(np.median(pos_est))
+        except Exception:
+            pass
+
+    if int(bg_mask.sum()) < 16:
+        return 0.0
+
+    if arr.ndim == 4:
+        n_t = arr.shape[3]
+        if modality == "dwi" and bvals is not None and len(bvals) == n_t:
+            b0_idx = np.where(bvals <= 50.0)[0]
+            vol_indices = b0_idx[:8] if b0_idx.size > 0 else np.arange(min(8, n_t))
+        else:
+            step = max(1, n_t // 8)
+            vol_indices = np.arange(0, n_t, step)[:8]
+        sigmas: list[float] = []
+        for idx in vol_indices:
+            bg_v = arr[..., int(idx)][bg_mask]
+            # Rayleigh / Dietrich estimator on single-volume background air
+            s_std = float(np.std(bg_v)) * 1.5264
+            s_mean = float(np.mean(np.abs(bg_v))) * 0.7979
+            sigmas.append(min(s_std, s_mean) if s_std > 1e-6 else s_mean)
+        return float(np.median(sigmas)) if sigmas else 0.0
+
+    bg_vals = arr[bg_mask]
+    s_std = float(np.std(bg_vals)) * 1.5264
+    s_mean = float(np.mean(np.abs(bg_vals))) * 0.7979
+    return float(min(s_std, s_mean) if s_std > 1e-6 else s_mean)
 
 
 def _largest_component(mask: np.ndarray) -> np.ndarray:

@@ -218,3 +218,70 @@ def test_optional_templates_pve_rsn_dti(three_seed_bids: Path, tmp_path: Path) -
     assert (out_dir / "sub-001/anat/sub-001_T1w.nii.gz").exists()
     assert (out_dir / "sub-001/func/sub-001_task-rest_bold.nii.gz").exists()
     assert (out_dir / "sub-001/dwi/sub-001_dwi.nii.gz").exists()
+
+
+def test_preserve_real_modalities_completes_missing_without_warp(
+    bids_phantom_dir: Path, tmp_path: Path
+) -> None:
+    """Real subjects keep existing QC-passing modalities untouched while missing modalities are completed."""
+    import json
+    import shutil
+
+    # Build a 1-subject partial real BIDS dataset with real T1w + real bold only (missing T2w, FLAIR, dwi)
+    partial_dir = tmp_path / "partial_real_bids"
+    (partial_dir / "sub-01" / "anat").mkdir(parents=True)
+    (partial_dir / "sub-01" / "func").mkdir(parents=True)
+    shutil.copy2(
+        bids_phantom_dir / "sub-01/anat/sub-01_T1w.nii.gz",
+        partial_dir / "sub-01/anat/sub-01_T1w.nii.gz",
+    )
+    shutil.copy2(
+        bids_phantom_dir / "sub-01/anat/sub-01_T1w.json",
+        partial_dir / "sub-01/anat/sub-01_T1w.json",
+    )
+    shutil.copy2(
+        bids_phantom_dir / "sub-01/func/sub-01_task-rest_bold.nii.gz",
+        partial_dir / "sub-01/func/sub-01_task-rest_bold.nii.gz",
+    )
+    shutil.copy2(
+        bids_phantom_dir / "sub-01/func/sub-01_task-rest_bold.json",
+        partial_dir / "sub-01/func/sub-01_task-rest_bold.json",
+    )
+
+    cfg = CohortSynthesisConfig(
+        global_seed=77,
+        preserve_real_modalities=True,
+        modalities=["T1w", "T2w", "FLAIR", "bold", "dwi"],
+        bold=BoldSynthesisConfig(voxel_size_mm=(3.5, 3.5, 3.5), n_trs=12),
+        dwi=DwiSynthesisConfig(voxel_size_mm=(3.5, 3.5, 3.5), n_b0=1, shells=[(1000.0, 6)]),
+    )
+    out_dir = tmp_path / "completed_real_bids"
+    res = synthesize_cohort(partial_dir, cfg, out_dir=out_dir, workers=1, device="cpu")
+    assert res.n_subjects == 1
+    assert res.rows[0]["participant_id"] == "sub-01"
+    assert res.rows[0]["warp_max_disp_mm"] == 0.0
+
+    prov = json.loads(res.rows[0]["modality_provenance_json"])
+    assert prov["T1w"] == "real"
+    assert prov["bold"] == "real"
+    assert prov["T2w"] == "contrast_converted_from_t1w"
+    assert prov["dwi"] == "synthesized_from_t1w_contrast"
+
+    # Real T1w and real BOLD must be preserved bit-for-bit
+    orig_t1 = np.asarray(nib.load(str(partial_dir / "sub-01/anat/sub-01_T1w.nii.gz")).get_fdata())
+    out_t1 = np.asarray(nib.load(str(out_dir / "sub-01/anat/sub-01_T1w.nii.gz")).get_fdata())
+    assert np.array_equal(orig_t1, out_t1)
+
+    orig_bold = np.asarray(
+        nib.load(str(partial_dir / "sub-01/func/sub-01_task-rest_bold.nii.gz")).get_fdata()
+    )
+    out_bold = np.asarray(
+        nib.load(str(out_dir / "sub-01/func/sub-01_task-rest_bold.nii.gz")).get_fdata()
+    )
+    assert np.array_equal(orig_bold, out_bold)
+
+    # Synthesized missing modalities exist and have valid shapes
+    assert (out_dir / "sub-01/anat/sub-01_T2w.nii.gz").exists()
+    assert (out_dir / "sub-01/anat/sub-01_FLAIR.nii.gz").exists()
+    assert (out_dir / "sub-01/dwi/sub-01_dwi.nii.gz").exists()
+

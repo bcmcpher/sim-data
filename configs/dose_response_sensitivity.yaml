@@ -1,0 +1,61 @@
+# Coupled dose-response sensitivity sweep for real QC-passing BIDS scans.
+#
+# Key design properties:
+# - `sites: []` -> uses an identity passthrough site ("NativeSite") so s=0.0 is bit-for-bit
+#   identical to each real input scan (written once per scan and linked via `baseline_scan_id`).
+# - `coupled_trajectories: true` -> shares Common Random Numbers (CRN) across increasing dose
+#   steps within each trajectory so IQM curves reflect pure intensity scaling, not random jumps.
+# - `noise_calibration: excess_variance` -> accounts for existing scanner thermal noise sigma_0.
+# - `output.naming_scheme: acq_blinded` -> raw-BIDS compliant (`DatasetType: "raw"`, accepted
+#   directly by MRIQC / fMRIPrep / QSIPrep) with shuffled opaque `acq-v01..acq-vNN` labels and
+#   ZERO artifact or severity leakage in filenames, JSON sidecars, or `*_scans.tsv`.
+#
+# NOTE (Unblinded Validation Mode):
+# Only when blinding is irrelevant (e.g., internal debugging or visual spot-checks), you may
+# change `naming_scheme: unblinded_validation` (and optionally `include_severity_in_acq: true`).
+# NEVER use `unblinded_validation` for human or AI QC rating studies because filenames directly
+# leak artifact identity and monotonic severity.
+
+global_seed: 2026
+modalities: ["T1w", "T2w", "FLAIR", "bold", "dwi"]
+
+sampling:
+  mode: dose_response
+  include_clean_baseline: true
+  shuffle_run_order: true
+  coupled_trajectories: true
+  replicates_per_artifact: 2
+  sweep_all_sites: true
+  noise_calibration: excess_variance
+  rotate_dwi_bvecs: false
+  dose_severities: [0.0, 0.15, 0.30, 0.45, 0.60, 0.75, 0.90]
+  artifacts:
+    - name: motion_3d
+    - name: motion_4d
+    - name: ghosting_3d
+    - name: nyquist_n2_ghost
+    - name: wrap_around
+    - name: bias_field
+    - name: rf_spike
+    - name: susceptibility_metal
+    - name: epi_susceptibility
+    - name: eddy_currents_dwi
+    - name: dwi_slice_dropout
+    - name: rician_noise
+    - name: temporal_drift
+    - name: fov_cropping
+    - name: gibbs_ringing
+    - name: anisotropy
+    - name: defacing_damage
+
+sites: []
+
+output:
+  save_nifti: true
+  write_bids_metadata: true
+  naming_scheme: acq_blinded
+  include_severity_in_acq: false
+  extract_iqms: false
+  render_views: false
+  write_packets: false
+  include_proxy_qc_labels: false

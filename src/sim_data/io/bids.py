@@ -1,4 +1,4 @@
-"""BIDS input discovery and zero-leakage blinded BIDS writing for multimodal MRI."""
+"""BIDS input discovery, per-subject mask discovery, and zero-leakage BIDS writing."""
 
 from __future__ import annotations
 
@@ -14,7 +14,7 @@ import pandas as pd
 from dipy.core.sphere import HemiSphere, disperse_charges
 from dipy.io.gradients import read_bvals_bvecs
 
-from sim_data.config import Modality, SiteNaming
+from sim_data.config import Modality, NamingScheme, SiteNaming
 
 _MODALITY_FOLDERS: dict[str, str] = {
     "T1w": "anat",
@@ -130,6 +130,35 @@ def discover_bids_scans(
     return scans
 
 
+def discover_subject_brain_mask(
+    bids_dir: str | Path,
+    subject: str,
+    session: str | None = None,
+    suffix: str = "desc-brain_mask",
+) -> Path | None:
+    """Auto-discover an external brain/ICV mask NIfTI for a BIDS subject (raw anat/ or derivatives/)."""
+    root = Path(bids_dir)
+    sub_part = f"sub-{subject}"
+    ses_rel = Path(sub_part) / f"ses-{session}" / "anat" if session else Path(sub_part) / "anat"
+
+    search_dirs: list[Path] = [root / ses_rel]
+    deriv_root = root / "derivatives"
+    if deriv_root.exists():
+        for pipeline_dir in sorted(deriv_root.iterdir()):
+            if pipeline_dir.is_dir():
+                search_dirs.append(pipeline_dir / ses_rel)
+
+    patterns = [f"*{suffix}.nii.gz", f"*{suffix}.nii", "*brain_mask*.nii.gz", "*brain_mask*.nii"]
+    for sdir in search_dirs:
+        if not sdir.exists():
+            continue
+        for pat in patterns:
+            matches = sorted(sdir.glob(pat))
+            if matches:
+                return matches[0]
+    return None
+
+
 def load_bids_scan(scan: BIDSScan) -> LoadedBIDSScan:
     """Load NIfTI image, JSON sidecar, and optional DWI .bval/.bvec files."""
     img = nib.load(str(scan.nifti_path))
@@ -181,17 +210,21 @@ def _sanitize_entity(value: str) -> str:
     return re.sub(r"[^A-Za-z0-9]", "", value)
 
 
-def build_blinded_bids_stem(
+def build_output_bids_stem(
     scan: BIDSScan,
-    run_index: int,
+    run_index: int = 1,
     site_id: str | None = None,
     site_naming: SiteNaming = "desc",
+    naming_scheme: NamingScheme = "blinded",
+    acq_label: str | None = None,
 ) -> tuple[Path, str]:
-    """Construct a zero-leakage blinded BIDS relative directory and filename stem.
+    """Construct a BIDS relative directory and filename stem under the chosen naming scheme.
 
-    Preserves input `ses-*` and `task-*` entities untouched, assigns an opaque sequential
-    `run-XX` index, and optionally isolates site identity via `desc-<site>` when
-    `site_naming == "desc"`. Never writes recipe, artifact, or severity labels into filenames.
+    - `blinded`: Shuffled `run-XX` (+ optional `desc-<Site>`), zero artifact/severity leakage.
+    - `acq_blinded`: Raw-BIDS compliant (`DatasetType: "raw"`) opaque shuffled `acq-vXX`
+      with zero artifact, severity, or run-order leakage.
+    - `unblinded_validation`: Raw-BIDS compliant `acq-<Profile>_run-<Step>` strictly for
+      non-blinded validation/debugging (explicit opt-in only).
     """
     sub_dir = Path(f"sub-{scan.subject}")
     if scan.session:
@@ -203,13 +236,43 @@ def build_blinded_bids_stem(
         parts.append(f"ses-{scan.session}")
     if "task" in scan.entities:
         parts.append(f"task-{scan.entities['task']}")
-    parts.append(f"run-{run_index:02d}")
-    if site_naming == "desc" and site_id:
-        sanitized_site = _sanitize_entity(site_id)
-        if sanitized_site:
-            parts.append(f"desc-{sanitized_site}")
+
+    if naming_scheme == "blinded":
+        parts.append(f"run-{run_index:02d}")
+        if site_naming == "desc" and site_id:
+            sanitized_site = _sanitize_entity(site_id)
+            if sanitized_site:
+                parts.append(f"desc-{sanitized_site}")
+    elif naming_scheme == "acq_blinded":
+        sanitized_acq = _sanitize_entity(acq_label or f"v{max(1, run_index):02d}")
+        if sanitized_acq:
+            parts.append(f"acq-{sanitized_acq}")
+    else:  # unblinded_validation
+        if acq_label:
+            sanitized_acq = _sanitize_entity(acq_label)
+            if sanitized_acq:
+                parts.append(f"acq-{sanitized_acq}")
+        if run_index > 0:
+            parts.append(f"run-{run_index:02d}")
+
     parts.append(scan.modality)
     return rel_dir, "_".join(parts)
+
+
+def build_blinded_bids_stem(
+    scan: BIDSScan,
+    run_index: int,
+    site_id: str | None = None,
+    site_naming: SiteNaming = "desc",
+) -> tuple[Path, str]:
+    """Backward-compatible wrapper constructing a zero-leakage blinded BIDS stem."""
+    return build_output_bids_stem(
+        scan=scan,
+        run_index=run_index,
+        site_id=site_id,
+        site_naming=site_naming,
+        naming_scheme="blinded",
+    )
 
 
 def write_bids_scan(
@@ -223,15 +286,22 @@ def write_bids_scan(
     sidecar: dict[str, Any],
     bvals: np.ndarray | None = None,
     bvecs: np.ndarray | None = None,
+    naming_scheme: NamingScheme = "blinded",
+    acq_label: str | None = None,
 ) -> dict[str, Path]:
-    """Write a blinded simulated BIDS NIfTI, clean zero-leakage JSON sidecar, and DWI tables.
+    """Write a simulated BIDS NIfTI, clean zero-leakage JSON sidecar, and DWI tables.
 
-    Strips any SimulationProvenance metadata so no artifact or ground-truth information
-    leaks into the image sidecar during manual or AI visual-QC evaluation.
+    Always strips SimulationProvenance metadata so no artifact or ground-truth information
+    leaks into the image sidecar under any naming scheme.
     """
     out_root = Path(out_dir)
-    rel_dir, stem = build_blinded_bids_stem(
-        scan, run_index=run_index, site_id=site_id, site_naming=site_naming
+    rel_dir, stem = build_output_bids_stem(
+        scan,
+        run_index=run_index,
+        site_id=site_id,
+        site_naming=site_naming,
+        naming_scheme=naming_scheme,
+        acq_label=acq_label,
     )
     target_dir = out_root / rel_dir
     target_dir.mkdir(parents=True, exist_ok=True)
@@ -272,13 +342,14 @@ def write_bids_root_files(
     out_dir: str | Path,
     rows: list[dict[str, Any]],
     site_naming: SiteNaming = "desc",
+    naming_scheme: NamingScheme = "blinded",
 ) -> dict[str, Path]:
     """Write standard BIDS root files: dataset_description.json, participants.tsv, *_scans.tsv, .bidsignore."""
     out_root = Path(out_dir)
     out_root.mkdir(parents=True, exist_ok=True)
     written: dict[str, Path] = {}
 
-    is_derivative = site_naming == "desc"
+    is_derivative = naming_scheme == "blinded" and site_naming == "desc"
     desc: dict[str, Any] = {
         "Name": "Simulated Multimodal MRI Dataset",
         "BIDSVersion": "1.9.0",
@@ -312,8 +383,9 @@ def write_bids_root_files(
     pd.DataFrame(part_rows).to_csv(part_path, sep="\t", index=False)
     written["participants"] = part_path
 
-    # Per-subject/session BIDS *_scans.tsv listing only filename and site_id (zero artifact leakage)
-    scans_grouped: dict[tuple[str, str], list[dict[str, str]]] = {}
+    # Per-subject/session BIDS *_scans.tsv: strictly zero-leakage (filename + site_id only)
+    # under blinded and acq_blinded modes; optional dose columns only in unblinded_validation.
+    scans_grouped: dict[tuple[str, str], list[dict[str, Any]]] = {}
     for row in rows:
         nifti_rel = str(row.get("nifti_path", ""))
         if not nifti_rel:
@@ -322,15 +394,21 @@ def write_bids_root_files(
         ses = str(row.get("session", ""))
         sub_root = f"sub-{sub}/ses-{ses}/" if ses else f"sub-{sub}/"
         rel_inside = nifti_rel[len(sub_root) :] if nifti_rel.startswith(sub_root) else nifti_rel
-        scans_grouped.setdefault((sub, ses), []).append(
-            {"filename": rel_inside, "site_id": str(row.get("site_id", ""))}
-        )
+        entry: dict[str, Any] = {
+            "filename": rel_inside,
+            "site_id": str(row.get("site_id", "")),
+        }
+        if naming_scheme == "unblinded_validation":
+            entry["trajectory_id"] = str(row.get("trajectory_id", ""))
+            entry["dose_step"] = int(row.get("dose_step", 0))
+            entry["dose_level"] = float(row.get("dose_level", 0.0))
+        scans_grouped.setdefault((sub, ses), []).append(entry)
 
     for (sub, ses), scan_entries in sorted(scans_grouped.items()):
         target_dir = out_root / f"sub-{sub}" / f"ses-{ses}" if ses else out_root / f"sub-{sub}"
         target_dir.mkdir(parents=True, exist_ok=True)
         fname = f"sub-{sub}_ses-{ses}_scans.tsv" if ses else f"sub-{sub}_scans.tsv"
-        scan_entries_sorted = sorted(scan_entries, key=lambda d: d["filename"])
+        scan_entries_sorted = sorted(scan_entries, key=lambda d: str(d["filename"]))
         pd.DataFrame(scan_entries_sorted).to_csv(target_dir / fname, sep="\t", index=False)
 
     # .bidsignore so BIDS validators & NiPreps tools ignore bookkeeping/evaluation files
@@ -345,6 +423,7 @@ def write_bids_root_files(
                 "packets/",
                 "harmonization_audit/",
                 "qc_benchmark/",
+                "sensitivity_analysis/",
             ]
         )
         + "\n",
