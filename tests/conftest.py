@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from sim_data.phantoms.synthetic import generate_synthetic_bids_cohort
+from ghibli.phantoms.synthetic import generate_synthetic_bids_cohort
 
 
 @pytest.fixture(scope="session")

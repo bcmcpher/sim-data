@@ -7,16 +7,16 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from sim_data.artifacts.base import ScanContext
-from sim_data.artifacts.registry import create_artifact
-from sim_data.io.bids import discover_bids_scans, load_bids_scan
-from sim_data.io.orientation import (
+from ghibli.artifacts.base import ScanContext
+from ghibli.artifacts.registry import create_artifact
+from ghibli.io.bids import discover_bids_scans, load_bids_scan
+from ghibli.io.orientation import (
     canonicalize_to_ras,
     compute_anatomical_priors,
     resolve_encoding_axes,
 )
-from sim_data.iqm.structural import extract_structural_iqms
-from sim_data.pipeline.labels import compute_fidelity_metrics
+from ghibli.iqm.structural import extract_structural_iqms
+from ghibli.pipeline.labels import compute_fidelity_metrics
 
 STRUCTURAL_ARTIFACTS = [
     "motion_3d",

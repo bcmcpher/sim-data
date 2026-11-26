@@ -27,19 +27,19 @@ import pandas as pd
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import common  # noqa: E402
 
-from sim_data.config import (  # noqa: E402
+from ghibli.config import (  # noqa: E402
     ArtifactSpec,
     OutputConfig,
     SamplingPlanConfig,
     SimulationConfig,
     SiteProfileConfig,
 )
-from sim_data.eval.deterministic_qc import evaluate_deterministic_qc  # noqa: E402
-from sim_data.harmonization.audit import merge_manifest_and_iqms, run_harmonization_audit  # noqa: E402
-from sim_data.io.orientation import compute_anatomical_priors  # noqa: E402
-from sim_data.iqm.extractor import extract_iqms_for_bids_dir  # noqa: E402
-from sim_data.pipeline.engine import run_simulation_plan  # noqa: E402
-from sim_data.sites.generator import load_sites_catalog  # noqa: E402
+from ghibli.eval.deterministic_qc import evaluate_deterministic_qc  # noqa: E402
+from ghibli.harmonization.audit import merge_manifest_and_iqms, run_harmonization_audit  # noqa: E402
+from ghibli.io.orientation import compute_anatomical_priors  # noqa: E402
+from ghibli.iqm.extractor import extract_iqms_for_bids_dir  # noqa: E402
+from ghibli.pipeline.engine import run_simulation_plan  # noqa: E402
+from ghibli.sites.generator import load_sites_catalog  # noqa: E402
 
 
 def _render_sites_comparison(

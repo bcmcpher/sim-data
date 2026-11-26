@@ -1,7 +1,7 @@
 """Step 01: Stage any single 3D T1w NIfTI into a clean 1-subject BIDS seed & inspect diagnostics.
 
 Why this step matters:
-- `sim-data` operates on BIDS directories. If you start from a standalone T1w NIfTI—or from a
+- `ghibli` operates on BIDS directories. If you start from a standalone T1w NIfTI—or from a
   multi-acquisition dataset like MR-ART where `acq-headmotion1` sorts alphabetically before
   `acq-standard`—staging a clean single-subject BIDS directory ensures the exact chosen
   no-motion T1w scan is used as the baseline seed.
@@ -25,7 +25,7 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import common  # noqa: E402
 
-from sim_data.io.orientation import (  # noqa: E402
+from ghibli.io.orientation import (  # noqa: E402
     canonicalize_to_ras_with_transform,
     compute_anatomical_priors,
     estimate_background_noise_sigma,
@@ -176,7 +176,7 @@ def run_step(
                 detail=(
                     "Explicit PhaseEncodingDirection and SliceEncodingDirection found in JSON."
                     if (has_pe and has_sl)
-                    else "Sidecar lacks PhaseEncodingDirection/SliceEncodingDirection (common in DICOM-converted 3D T1w such as MR-ART); sim-data defaulted to PE=1 (A-P), SL=2 (S-I)."
+                    else "Sidecar lacks PhaseEncodingDirection/SliceEncodingDirection (common in DICOM-converted 3D T1w such as MR-ART); ghibli defaulted to PE=1 (A-P), SL=2 (S-I)."
                 ),
             )
         )

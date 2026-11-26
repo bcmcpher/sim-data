@@ -1,6 +1,6 @@
-# `sim-data` Getting Started Tutorial & End-to-End Verification
+# `ghibli` Getting Started Tutorial & End-to-End Verification
 
-This tutorial walks through **every major working path** of `sim-data` starting from **any single clean 3D T1w NIfTI image**. It is designed both as a hands-on onboarding guide and as a diagnostic verification harness that surfaces calibration, anatomical masking, and IQM sensitivity gaps on real clinical/research MRI data.
+This tutorial walks through **every major working path** of `ghibli` starting from **any single clean 3D T1w NIfTI image**. It is designed both as a hands-on onboarding guide and as a diagnostic verification harness that surfaces calibration, anatomical masking, and IQM sensitivity gaps on real clinical/research MRI data.
 
 ## Quickstart (One Command)
 
@@ -35,7 +35,7 @@ uv run --no-sync python tutorials/getting_started/run_all.py \
 
 Each script can also be executed independently on the same `--out-dir` to inspect or re-run individual stages:
 
-| Script | What It Tests | Key `sim-data` Paths Exercised |
+| Script | What It Tests | Key `ghibli` Paths Exercised |
 | :--- | :--- | :--- |
 | `01_stage_input.py` | Stages any 3D T1w (+ optional JSON/mask) into a clean 1-subject BIDS seed & inspects orientation, encoding axes, foreground mask, and native noise $\sigma_0$. | `canonicalize_to_ras_with_transform`, `resolve_encoding_axes`, `compute_anatomical_priors`, `estimate_background_noise_sigma` |
 | `02_convert_modalities.py` | Converts the T1w into all supported contrasts & modalities (`T2w`, `FLAIR`, 4D `bold`, 4D `dwi`) while keeping the real T1w untouched. | `convert-contrast` (`invert_t1w_to_t2w`), `synthesize-cohort --preserve-real`, `extract-iqms`, `render_scan_views` |

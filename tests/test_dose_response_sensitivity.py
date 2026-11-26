@@ -10,20 +10,20 @@ import pandas as pd
 import pytest
 from pydantic import ValidationError
 
-from sim_data.artifacts.base import ScanContext
-from sim_data.artifacts.registry import create_artifact
-from sim_data.config import (
+from ghibli.artifacts.base import ScanContext
+from ghibli.artifacts.registry import create_artifact
+from ghibli.config import (
     ArtifactSpec,
     CompoundTrajectorySpec,
     OutputConfig,
     SamplingPlanConfig,
     SimulationConfig,
 )
-from sim_data.eval.sensitivity import run_sensitivity_analysis
-from sim_data.io.bids import discover_bids_scans, load_bids_scan
-from sim_data.io.orientation import canonicalize_to_ras, compute_anatomical_priors
-from sim_data.iqm.extractor import extract_iqms_for_bids_dir
-from sim_data.pipeline.engine import run_simulation_plan
+from ghibli.eval.sensitivity import run_sensitivity_analysis
+from ghibli.io.bids import discover_bids_scans, load_bids_scan
+from ghibli.io.orientation import canonicalize_to_ras, compute_anatomical_priors
+from ghibli.iqm.extractor import extract_iqms_for_bids_dir
+from ghibli.pipeline.engine import run_simulation_plan
 
 
 def test_blinding_guardrail_blocks_severity_in_acq_unless_unblinded_validation() -> None:

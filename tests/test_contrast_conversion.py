@@ -8,12 +8,12 @@ import nibabel as nib
 import numpy as np
 from scipy import ndimage, stats
 
-from sim_data.config import ContrastConversionConfig, StructuralSynthesisConfig
-from sim_data.io.bids import discover_bids_scans, load_bids_scan
-from sim_data.io.orientation import canonicalize_to_ras, compute_anatomical_priors
-from sim_data.synthesis.contrast import invert_t1w_to_t2w
-from sim_data.synthesis.modalities import synthesize_structural_modality
-from sim_data.synthesis.tissue import estimate_tissue_pve, sample_tissue_mri_params
+from ghibli.config import ContrastConversionConfig, StructuralSynthesisConfig
+from ghibli.io.bids import discover_bids_scans, load_bids_scan
+from ghibli.io.orientation import canonicalize_to_ras, compute_anatomical_priors
+from ghibli.synthesis.contrast import invert_t1w_to_t2w
+from ghibli.synthesis.modalities import synthesize_structural_modality
+from ghibli.synthesis.tissue import estimate_tissue_pve, sample_tissue_mri_params
 
 
 def test_invert_t1w_to_t2w_flips_contrast_keeps_air_dark_and_inverts_texture(

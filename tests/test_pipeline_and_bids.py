@@ -7,16 +7,16 @@ from pathlib import Path
 
 import pandas as pd
 
-from sim_data.config import (
+from ghibli.config import (
     ArtifactSpec,
     OutputConfig,
     SamplingPlanConfig,
     SimulationConfig,
     SiteProfileConfig,
 )
-from sim_data.eval.deterministic_qc import evaluate_deterministic_qc
-from sim_data.iqm.extractor import extract_iqms_for_bids_dir
-from sim_data.pipeline.engine import run_simulation_plan
+from ghibli.eval.deterministic_qc import evaluate_deterministic_qc
+from ghibli.iqm.extractor import extract_iqms_for_bids_dir
+from ghibli.pipeline.engine import run_simulation_plan
 
 
 def test_blinded_bids_zero_leakage_and_decoupled_iqms(

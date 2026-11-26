@@ -6,17 +6,17 @@ from pathlib import Path
 
 import pandas as pd
 
-from sim_data.config import (
+from ghibli.config import (
     ArtifactSpec,
     OutputConfig,
     SamplingPlanConfig,
     SimulationConfig,
     SiteProfileConfig,
 )
-from sim_data.harmonization.audit import run_harmonization_audit
-from sim_data.iqm.extractor import extract_iqms_for_bids_dir
-from sim_data.phantoms.synthetic import generate_synthetic_bids_cohort
-from sim_data.pipeline.engine import run_simulation_plan
+from ghibli.harmonization.audit import run_harmonization_audit
+from ghibli.iqm.extractor import extract_iqms_for_bids_dir
+from ghibli.phantoms.synthetic import generate_synthetic_bids_cohort
+from ghibli.pipeline.engine import run_simulation_plan
 
 
 def test_multisite_image_profiles_harmonized_by_combat_and_covbat(tmp_path: Path) -> None:

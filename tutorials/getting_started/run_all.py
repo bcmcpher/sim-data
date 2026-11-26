@@ -1,4 +1,4 @@
-"""Master runner executing Steps 01 -> 05 of the sim-data Getting Started tutorial.
+"""Master runner executing Steps 01 -> 05 of the ghibli Getting Started tutorial.
 
 Example usage:
     # Real MR-ART no-motion T1w scan (default if ../data/mrart exists)
@@ -85,7 +85,7 @@ def run_all(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Run the complete sim-data Getting Started tutorial & verification suite."
+        description="Run the complete ghibli Getting Started tutorial & verification suite."
     )
     parser.add_argument("--t1w", type=Path, default=None, help="Path to any clean 3D T1w NIfTI.")
     parser.add_argument("--json", type=Path, default=None, help="Optional BIDS JSON sidecar.")

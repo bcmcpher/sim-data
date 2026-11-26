@@ -6,16 +6,16 @@ from pathlib import Path
 
 import numpy as np
 
-from sim_data.artifacts.base import ScanContext
-from sim_data.artifacts.registry import create_artifact
-from sim_data.io.bids import discover_bids_scans, load_bids_scan
-from sim_data.io.orientation import (
+from ghibli.artifacts.base import ScanContext
+from ghibli.artifacts.registry import create_artifact
+from ghibli.io.bids import discover_bids_scans, load_bids_scan
+from ghibli.io.orientation import (
     canonicalize_to_ras,
     compute_anatomical_priors,
     resolve_encoding_axes,
 )
-from sim_data.iqm.diffusion import extract_diffusion_iqms
-from sim_data.iqm.functional import extract_functional_iqms
+from ghibli.iqm.diffusion import extract_diffusion_iqms
+from ghibli.iqm.functional import extract_functional_iqms
 
 
 def _make_4d_context(

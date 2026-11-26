@@ -1,6 +1,6 @@
-# `sim-data`: Multimodal MRI Artifact & Multi-Site BIDS Simulator
+# `GHIBLI`: Generative Harmonization & Imaging Benchmark Library for IQMs
 
-`sim-data` generates **blinded, leakage-free multimodal MRI BIDS datasets** (**T1w, T2w, FLAIR, 4D BOLD fMRI, and 4D DWI**) with controlled scanner/site effects, continuous T1w→T2w sequential contrast synthesis, and **coupled Common-Random-Numbers (CRN) dose-response artifact trajectories** from real QC-passing BIDS scans.
+**GHIBLI** (`ghibli`) generates **blinded, leakage-free multimodal MRI BIDS datasets** (**T1w, T2w, FLAIR, 4D BOLD fMRI, and 4D DWI**) with controlled scanner/site effects, continuous T1w→T2w/FLAIR/EPI contrast synthesis with built-in brain extraction, and **coupled Common-Random-Numbers (CRN) dose-response artifact trajectories** from real QC-passing BIDS scans.
 
 It combines **MONAI**, **TorchIO**, **DIPY**, **SimpleITK**, and **custom MRI-physics operators** in a strict 7-stage causal acquisition order, records all injected artifact and site weights exclusively in a ground-truth **`manifest.tsv`** (keeping filenames and JSON sidecars completely clean for unbiased manual and AI evaluations), and provides decoupled post-hoc tools for **blind NiPreps-aligned IQM extraction** (MRIQC, fMRIPrep, QSIPrep), **IQM dose-response sensitivity ranking**, and **ComBat / CovBat multi-site harmonization auditing**.
 
@@ -8,7 +8,7 @@ It combines **MONAI**, **TorchIO**, **DIPY**, **SimpleITK**, and **custom MRI-ph
 
 ## Installation
 
-`sim-data` uses [`uv`](https://docs.astral.sh/uv/) and provides mutually exclusive PyTorch extras so the same `pyproject.toml` supports both **CPU-only** machines and **NVIDIA RTX 50-series (Blackwell `sm_120` / CUDA 12.8)** GPUs.
+`ghibli` uses [`uv`](https://docs.astral.sh/uv/) and provides mutually exclusive PyTorch extras so the same `pyproject.toml` supports both **CPU-only** machines and **NVIDIA RTX 50-series (Blackwell `sm_120` / CUDA 12.8)** GPUs.
 
 ### Prerequisites
 - Python `>= 3.10`
@@ -73,7 +73,7 @@ my_bids/
 ### 1. (Optional) Standalone Continuous T1w → T2w / EPI Contrast Conversion
 Convert a clean T1w NIfTI into continuous `T2w`, fat-suppressed $T_2^*$ `bold_s0`, or spin-echo `dwi_b0` contrast using N4ITK bias correction + ICV/bone/scalp separation (with optional external brain mask) + monotone decreasing PCHIP spline anchored to Bloch tissue signals:
 ```bash
-uv run --no-sync sim-data convert-contrast \
+uv run --no-sync ghibli convert-contrast \
   --t1w ./sub-01_T1w.nii.gz \
   --brain-mask ./sub-01_desc-brain_mask.nii.gz \
   --target T2w \
@@ -83,7 +83,7 @@ uv run --no-sync sim-data convert-contrast \
 ### 2. (Optional) Complete Missing Modalities on Real Subjects or Synthesize a Cohort
 Preserve real subjects' existing QC-passing modalities untouched (zero warp) and sequentially synthesize only missing modalities (`T1w → T2w → anti-aliased downsample → BOLD / DWI`):
 ```bash
-uv run --no-sync sim-data synthesize-cohort \
+uv run --no-sync ghibli synthesize-cohort \
   --seed-bids ./real_qc_passing_bids \
   --out ./completed_multimodal_bids \
   --preserve-real \
@@ -92,7 +92,7 @@ uv run --no-sync sim-data synthesize-cohort \
 ```
 Or expand **3–5+ structural seeds** into $N$ anatomically distinct warped subjects:
 ```bash
-uv run --no-sync sim-data synthesize-cohort \
+uv run --no-sync ghibli synthesize-cohort \
   --seed-bids ./clean_structural_seeds \
   --out ./synthetic_clean_cohort \
   --config configs/synthesize_cohort.yaml \
@@ -100,12 +100,12 @@ uv run --no-sync sim-data synthesize-cohort \
   --workers 4 \
   --device auto
 ```
-*(Or create a quick offline synthetic phantom cohort for smoke tests via `uv run --no-sync sim-data init-phantom --out ./demo_bids --n-subjects 4`.)*
+*(Or create a quick offline synthetic phantom cohort for smoke tests via `uv run --no-sync ghibli init-phantom --out ./demo_bids --n-subjects 4`.)*
 
 ### 3. Generate Coupled Dose-Response or Multi-Site Blinded BIDS Scans + `manifest.tsv`
 **Coupled dose-response sensitivity sweep (real QC-passing scans, raw-BIDS `acq_blinded`, passthrough $s=0$ baseline):**
 ```bash
-uv run --no-sync sim-data generate \
+uv run --no-sync ghibli generate \
   --bids-dir ./completed_multimodal_bids \
   --config configs/dose_response_sensitivity.yaml \
   --out-dir ./dose_bids \
@@ -116,7 +116,7 @@ uv run --no-sync sim-data generate \
 
 **Multi-site factorial benchmark:**
 ```bash
-uv run --no-sync sim-data generate \
+uv run --no-sync ghibli generate \
   --bids-dir ./demo_bids \
   --config configs/default_multimodal.yaml \
   --out-dir ./demo_out \
@@ -127,7 +127,7 @@ uv run --no-sync sim-data generate \
 
 ### 4. Independently Extract Blind NiPreps IQMs (or Run Real MRIQC / fMRIPrep / QSIPrep)
 ```bash
-uv run --no-sync sim-data extract-iqms \
+uv run --no-sync ghibli extract-iqms \
   --bids-dir ./dose_bids \
   --out ./dose_iqms.tsv \
   --workers 4
@@ -135,17 +135,17 @@ uv run --no-sync sim-data extract-iqms \
 
 ### 5. Analyze IQM Sensitivity Across Increasing Artifact Intensities
 ```bash
-uv run --no-sync sim-data analyze-sensitivity \
+uv run --no-sync ghibli analyze-sensitivity \
   --manifest ./dose_manifest.tsv \
   --iqms ./dose_iqms.tsv \
   --out-dir ./dose_sensitivity_report \
   --modality T1w
 ```
-Works with both `sim-data extract-iqms` TSVs and external **MRIQC / fMRIPrep / QSIPrep** group TSVs. Outputs `sensitivity_summary.tsv`, `sensitivity_matrix.tsv`, `sensitivity_report.json`, `sensitivity_heatmap.png`, and `dose_response_curves.png` (within-trajectory Spearman $\rho$, standardized slope, Cohen's $d$, Minimum Detectable Severity / LoD, and cross-artifact specificity).
+Works with both `ghibli extract-iqms` TSVs and external **MRIQC / fMRIPrep / QSIPrep** group TSVs. Outputs `sensitivity_summary.tsv`, `sensitivity_matrix.tsv`, `sensitivity_report.json`, `sensitivity_heatmap.png`, and `dose_response_curves.png` (within-trajectory Spearman $\rho$, standardized slope, Cohen's $d$, Minimum Detectable Severity / LoD, and cross-artifact specificity).
 
 ### 6. Audit ComBat vs. CovBat Multi-Site Harmonization
 ```bash
-uv run --no-sync sim-data verify-harmonization \
+uv run --no-sync ghibli verify-harmonization \
   --manifest ./demo_manifest.tsv \
   --iqms ./demo_iqms.tsv \
   --out-dir ./demo_harmonization_audit \
@@ -154,7 +154,7 @@ uv run --no-sync sim-data verify-harmonization \
 
 ### 7. (Optional) Benchmark Deterministic IQM Baseline
 ```bash
-uv run --no-sync sim-data benchmark-deterministic \
+uv run --no-sync ghibli benchmark-deterministic \
   --manifest ./demo_manifest.tsv \
   --iqms ./demo_iqms.tsv \
   --out-dir ./demo_qc_benchmark \
@@ -208,7 +208,7 @@ uv run --no-sync python tutorials/getting_started/run_all.py \
 
 ```bash
 # Static type checking (mypy with pydantic plugin)
-uv run --no-sync mypy src/sim_data
+uv run --no-sync mypy src/ghibli
 
 # Linting (ruff)
 uv run --no-sync ruff check src tests

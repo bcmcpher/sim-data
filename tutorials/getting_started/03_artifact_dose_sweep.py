@@ -7,7 +7,7 @@ Exercises:
   - `sites = []` (`NativeSite` passthrough so s=0.0 is bit-for-bit identical to input)
   - `noise_calibration = "excess_variance"`
   - `naming_scheme = "acq_blinded"` (raw-BIDS compliant, zero artifact/severity leakage)
-  - `render_views = True` (exercises `sim_data.views.mosaic`)
+  - `render_views = True` (exercises `ghibli.views.mosaic`)
 - All 11 structural artifacts on the real T1w scan (34 scans)
 - All 6 remaining 4D/EPI/DWI-specific artifacts on the synthesized BOLD & DWI scans
   (covering 17/17 artifacts in `ARTIFACT_REGISTRY`, unless `--t1w-only` is passed)
@@ -31,19 +31,19 @@ from PIL import Image, ImageDraw
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import common  # noqa: E402
 
-from sim_data.artifacts.registry import ARTIFACT_REGISTRY, compatible_artifacts  # noqa: E402
-from sim_data.config import (  # noqa: E402
+from ghibli.artifacts.registry import ARTIFACT_REGISTRY, compatible_artifacts  # noqa: E402
+from ghibli.config import (  # noqa: E402
     ArtifactSpec,
     OutputConfig,
     SamplingPlanConfig,
     SimulationConfig,
 )
-from sim_data.eval.sensitivity import run_sensitivity_analysis  # noqa: E402
-from sim_data.io.orientation import compute_anatomical_priors  # noqa: E402
-from sim_data.iqm.diffusion import compute_bad_slices_qsiprep  # noqa: E402
-from sim_data.iqm.extractor import extract_iqms_for_bids_dir  # noqa: E402
-from sim_data.iqm.functional import estimate_fd_proxy  # noqa: E402
-from sim_data.pipeline.engine import run_simulation_plan  # noqa: E402
+from ghibli.eval.sensitivity import run_sensitivity_analysis  # noqa: E402
+from ghibli.io.orientation import compute_anatomical_priors  # noqa: E402
+from ghibli.iqm.diffusion import compute_bad_slices_qsiprep  # noqa: E402
+from ghibli.iqm.extractor import extract_iqms_for_bids_dir  # noqa: E402
+from ghibli.iqm.functional import estimate_fd_proxy  # noqa: E402
+from ghibli.pipeline.engine import run_simulation_plan  # noqa: E402
 
 # 4D/EPI/DWI-specific artifacts not compatible with 3D T1w (plus motion_4d on DWI to verify bvecs)
 BOLD_SWEEP_ARTIFACTS = ["motion_4d", "nyquist_n2_ghost", "epi_susceptibility", "temporal_drift"]

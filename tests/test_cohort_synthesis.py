@@ -9,7 +9,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from sim_data.config import (
+from ghibli.config import (
     ArtifactSpec,
     BoldSynthesisConfig,
     CohortSynthesisConfig,
@@ -22,14 +22,14 @@ from sim_data.config import (
     SiteProfileConfig,
     StructuralSynthesisConfig,
 )
-from sim_data.io.bids import discover_bids_scans
-from sim_data.io.orientation import compute_anatomical_priors
-from sim_data.iqm.diffusion import extract_diffusion_iqms
-from sim_data.iqm.extractor import extract_iqms_for_bids_dir
-from sim_data.iqm.functional import extract_functional_iqms
-from sim_data.phantoms.synthetic import generate_synthetic_bids_cohort
-from sim_data.pipeline.engine import run_simulation_plan
-from sim_data.synthesis.cohort import synthesize_cohort
+from ghibli.io.bids import discover_bids_scans
+from ghibli.io.orientation import compute_anatomical_priors
+from ghibli.iqm.diffusion import extract_diffusion_iqms
+from ghibli.iqm.extractor import extract_iqms_for_bids_dir
+from ghibli.iqm.functional import extract_functional_iqms
+from ghibli.phantoms.synthetic import generate_synthetic_bids_cohort
+from ghibli.pipeline.engine import run_simulation_plan
+from ghibli.synthesis.cohort import synthesize_cohort
 
 
 @pytest.fixture(scope="module")
@@ -145,7 +145,7 @@ def test_template_free_multimodal_cohort_physics_and_diversity(
     assert dwi_iqm["raw_neighbor_corr"] > 0.70
     assert dwi_iqm["raw_num_bad_slices"] == 0.0
 
-    # Verify synthesized cohort plugs directly into blinded `sim-data generate` -> `extract-iqms`
+    # Verify synthesized cohort plugs directly into blinded `ghibli generate` -> `extract-iqms`
     sim_cfg = SimulationConfig(
         global_seed=42,
         modalities=["T1w", "bold", "dwi"],

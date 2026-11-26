@@ -7,16 +7,16 @@ from pathlib import Path
 import nibabel as nib
 import numpy as np
 
-from sim_data.artifacts.base import ScanContext
-from sim_data.artifacts.registry import create_artifact
-from sim_data.config import (
+from ghibli.artifacts.base import ScanContext
+from ghibli.artifacts.registry import create_artifact
+from ghibli.config import (
     ArtifactSpec,
     OutputConfig,
     SamplingPlanConfig,
     SimulationConfig,
 )
-from sim_data.io.bids import discover_bids_scans, load_bids_scan
-from sim_data.io.orientation import (
+from ghibli.io.bids import discover_bids_scans, load_bids_scan
+from ghibli.io.orientation import (
     canonicalize_to_ras,
     canonicalize_to_ras_with_transform,
     compute_anatomical_priors,
@@ -24,7 +24,7 @@ from sim_data.io.orientation import (
     reorient_bvecs_to_ras,
     resolve_encoding_axes,
 )
-from sim_data.pipeline.engine import run_simulation_plan
+from ghibli.pipeline.engine import run_simulation_plan
 
 
 def test_non_ras_orientation_remaps_encoding_axes_and_bvecs() -> None:

@@ -1,6 +1,6 @@
 """Step 02: Convert the staged T1w into every supported contrast & modality.
 
-Tests both modality conversion code paths in sim-data:
+Tests both modality conversion code paths in ghibli:
 1. Standalone `convert-contrast` (`invert_t1w_to_t2w`) for all 3 targets: `T2w`, `bold_s0`, `dwi_b0`,
    rendering the internal N4ITK + ICV/scalp/bone compartment separation so masking gaps are visible.
 2. Full multimodal completion via `synthesize_cohort(..., preserve_real_modalities=True)` keeping
@@ -24,18 +24,18 @@ from dipy.io.gradients import read_bvals_bvecs
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import common  # noqa: E402
 
-from sim_data.config import (  # noqa: E402
+from ghibli.config import (  # noqa: E402
     BoldSynthesisConfig,
     CohortSynthesisConfig,
     ContrastConversionConfig,
     DwiSynthesisConfig,
 )
-from sim_data.io.bids import discover_bids_scans  # noqa: E402
-from sim_data.io.orientation import compute_anatomical_priors  # noqa: E402
-from sim_data.iqm.extractor import extract_iqms_for_bids_dir  # noqa: E402
-from sim_data.synthesis.cohort import synthesize_cohort  # noqa: E402
-from sim_data.synthesis.contrast import ContrastTarget, invert_t1w_to_t2w  # noqa: E402
-from sim_data.views.mosaic import render_scan_views  # noqa: E402
+from ghibli.io.bids import discover_bids_scans  # noqa: E402
+from ghibli.io.orientation import compute_anatomical_priors  # noqa: E402
+from ghibli.iqm.extractor import extract_iqms_for_bids_dir  # noqa: E402
+from ghibli.synthesis.cohort import synthesize_cohort  # noqa: E402
+from ghibli.synthesis.contrast import ContrastTarget, invert_t1w_to_t2w  # noqa: E402
+from ghibli.views.mosaic import render_scan_views  # noqa: E402
 
 
 def _render_compartment_figure(

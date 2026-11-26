@@ -168,10 +168,10 @@ def _build_html_report(
         "<!DOCTYPE html>",
         '<html lang="en"><head><meta charset="utf-8" />',
         '<meta name="viewport" content="width=device-width, initial-scale=1" />',
-        "<title>sim-data Getting Started Verification Report</title>",
+        "<title>ghibli Getting Started Verification Report</title>",
         f"<style>{_HTML_CSS}</style>",
         "</head><body><main>",
-        "<h1><code>sim-data</code> Getting Started Verification Report</h1>",
+        "<h1><code>ghibli</code> Getting Started Verification Report</h1>",
         '<nav class="toc">'
         '<a href="#gaps">Flagged Gaps</a>'
         '<a href="#checks">All Checks</a>'
@@ -197,7 +197,7 @@ def _build_html_report(
         f'<code>{html.escape(str(s1.get("orig_axcodes", "?")))}</code> &rarr; <code>RAS+</code>)</p>',
         '<div class="guide-box">'
         "<p><strong>About this report:</strong> Starting from a single clean 3D T1w scan, this tutorial exercises every major "
-        "working path in <code>sim-data</code>: (1) RAS+ canonicalization &amp; anatomical priors, (2) internal brain extraction "
+        "working path in <code>ghibli</code>: (1) RAS+ canonicalization &amp; anatomical priors, (2) internal brain extraction "
         "and sequential modality completion into <code>T2w</code>, <code>FLAIR</code>, lower-resolution skull-free 4D <code>bold</code>, "
         "and 4D <code>dwi</code>, (3) coupled Common-Random-Numbers (CRN) dose-response trajectories across all 17/17 registered "
         "artifacts at Low (0.25), Mid (0.55), and High (0.85) severity with zero-leakage <code>acq_blinded</code> BIDS naming, "
@@ -435,7 +435,7 @@ def run_step(
     total_sec = round(sum(float(b.get("elapsed_sec", 0.0)) for b in (s1, s2, s3, s4)), 2)
 
     lines: list[str] = [
-        "# `sim-data` Getting Started Verification Report",
+        "# `ghibli` Getting Started Verification Report",
         "",
         f"- **Input T1w**: `{s1.get('source_t1w', 'N/A')}` (`{s1.get('source_kind', 'unknown')}`)",
         f"- **Geometry**: shape `{s1.get('ras_shape')}`, zooms `{s1.get('zooms_mm')} mm`, native orientation `{s1.get('orig_axcodes')}` → `RAS+`",

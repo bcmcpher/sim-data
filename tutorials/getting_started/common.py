@@ -1,4 +1,4 @@
-"""Shared helpers for the sim-data Getting Started tutorial & verification suite."""
+"""Shared helpers for the ghibli Getting Started tutorial & verification suite."""
 
 from __future__ import annotations
 
@@ -15,8 +15,8 @@ import matplotlib.pyplot as plt
 import nibabel as nib
 import numpy as np
 
-from sim_data.io.orientation import canonicalize_to_ras, compute_anatomical_priors
-from sim_data.phantoms.synthetic import generate_synthetic_bids_cohort
+from ghibli.io.orientation import canonicalize_to_ras, compute_anatomical_priors
+from ghibli.phantoms.synthetic import generate_synthetic_bids_cohort
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_MRART_T1W = (
@@ -84,7 +84,7 @@ def resolve_input_t1w(
 
     Priority:
     1. Explicit `--t1w` path (works with any 3D T1w NIfTI).
-    2. `--use-phantom` (generates a clean synthetic T1w via `sim-data init-phantom`).
+    2. `--use-phantom` (generates a clean synthetic T1w via `ghibli init-phantom`).
     3. Local MR-ART no-motion example (`sub-000103_acq-standard_T1w.nii.gz`) if present.
     """
     if use_phantom:

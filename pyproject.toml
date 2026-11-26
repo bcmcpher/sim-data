@@ -3,9 +3,9 @@ requires = ["hatchling>=1.25.0"]
 build-backend = "hatchling.build"
 
 [project]
-name = "sim-data"
+name = "ghibli"
 version = "0.1.0"
-description = "Physics-ordered multimodal MRI artifact and multi-site effect simulator for visual & automated QC"
+description = "GHIBLI: Generative Harmonization & Imaging Benchmark Library for IQMs"
 readme = "README.md"
 license = { file = "LICENSE" }
 requires-python = ">=3.10"
@@ -50,10 +50,10 @@ dev = [
 ]
 
 [project.scripts]
-sim-data = "sim_data.cli:app"
+ghibli = "ghibli.cli:app"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/sim_data"]
+packages = ["src/ghibli"]
 
 [tool.uv]
 conflicts = [
@@ -91,7 +91,7 @@ ignore = ["E501", "B008"]
 [tool.mypy]
 python_version = "3.10"
 mypy_path = "src"
-packages = ["sim_data"]
+packages = ["ghibli"]
 plugins = ["pydantic.mypy"]
 disallow_untyped_defs = true
 disallow_incomplete_defs = true
