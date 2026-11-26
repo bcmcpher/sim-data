@@ -23,6 +23,7 @@ from sim_data.io.bids import (
 )
 from sim_data.io.orientation import canonicalize_to_ras
 from sim_data.pipeline.sampler import derive_seed
+from sim_data.synthesis.brain_mask import extract_brain_mask
 from sim_data.synthesis.contrast import get_contrast_converter
 from sim_data.synthesis.modalities import (
     synthesize_bold_4d,
@@ -32,7 +33,6 @@ from sim_data.synthesis.modalities import (
 from sim_data.synthesis.tissue import (
     TissuePVEMaps,
     estimate_tissue_pve,
-    resample_nifti_to_grid,
     sample_tissue_mri_params,
 )
 from sim_data.synthesis.warp import DiffeomorphicField, sample_diffeomorphic_field, warp_volume
@@ -200,19 +200,25 @@ def _synthesize_single_subject(
                 np.asarray(res_t2.get_fdata(dtype=np.float32), dtype=np.float32), 0.0
             )
 
-    # Resolve external brain/ICV mask (Option 2: explicit template override or per-subject BIDS mask)
-    eff_brain_mask_path = config.templates.brain_mask_nifti or seed_subj.brain_mask_path
-    seed_brain_mask_arr: np.ndarray | None = None
-    if eff_brain_mask_path is not None:
-        raw_bm = resample_nifti_to_grid(eff_brain_mask_path, shape, affine, order=0)
-        if raw_bm.ndim == 4:
-            raw_bm = raw_bm[..., 0]
-        seed_brain_mask_arr = np.asarray(raw_bm > 0.5, dtype=bool)
-
     # Check if we even need to synthesize any missing modalities in preserve_real mode
     missing_mods = [
         m for m in config.modalities if not (preserve_real and seed_subj.get_real_scan(m) is not None)
     ]
+
+    # Resolve brain/ICV mask ONCE per subject (external mask -> internal EVAC+ -> morphological)
+    eff_brain_mask_path = config.templates.brain_mask_nifti or seed_subj.brain_mask_path
+    seed_brain_mask_arr: np.ndarray | None = None
+    brain_mask_method = "none"
+    if missing_mods:
+        bm_res = extract_brain_mask(
+            t1_corr=t1_data,
+            affine=affine,
+            method=config.contrast.brain_extraction,
+            brain_mask_path=eff_brain_mask_path,
+            device=device,
+        )
+        seed_brain_mask_arr = bm_res.icv_mask
+        brain_mask_method = bm_res.method
 
     # 1. Estimate soft tissue PVE maps in seed space (when any modality needs synthesis)
     if missing_mods:
@@ -222,6 +228,7 @@ def _synthesize_single_subject(
             t2_data=t2_data,
             template_pve_path=config.templates.tissue_pve_nifti,
             brain_mask_path=eff_brain_mask_path,
+            brain_mask_array=seed_brain_mask_arr,
             seed=seed,
         )
     else:
@@ -378,6 +385,9 @@ def _synthesize_single_subject(
                 t2_base_vol=bold_t2_base,
                 fat_retention_epi=config.contrast.fat_retention_epi,
                 t2_base_is_fat_suppressed=bold_base_fat_suppressed,
+                epi_skull_strip=config.contrast.epi_skull_strip,
+                epi_crop_to_brain=config.contrast.epi_crop_to_brain,
+                epi_crop_pad_mm=config.contrast.epi_crop_pad_mm,
             )
             stem = f"{stem_prefix}_task-rest_bold"
             nib.save(nib.Nifti1Image(bold_4d, bold_aff), str(func_dir / f"{stem}.nii.gz"))
@@ -414,6 +424,9 @@ def _synthesize_single_subject(
                 t2_base_vol=dwi_t2_base,
                 fat_retention_epi=config.contrast.fat_retention_epi,
                 t2_base_is_fat_suppressed=dwi_base_fat_suppressed,
+                epi_skull_strip=config.contrast.epi_skull_strip,
+                epi_crop_to_brain=config.contrast.epi_crop_to_brain,
+                epi_crop_pad_mm=config.contrast.epi_crop_pad_mm,
             )
             stem = f"{stem_prefix}_dwi"
             nib.save(nib.Nifti1Image(dwi_4d, dwi_aff), str(dwi_dir / f"{stem}.nii.gz"))
@@ -448,6 +461,7 @@ def _synthesize_single_subject(
         "preserve_real_modalities": preserve_real,
         "used_seed_t2": seed_subj.t2_scan is not None,
         "used_external_brain_mask": eff_brain_mask_path is not None,
+        "brain_mask_method": brain_mask_method,
         "seed": seed,
         "flipped_lr": field.flipped_lr,
         "warp_max_disp_mm": field.max_disp_mm,

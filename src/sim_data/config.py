@@ -14,6 +14,7 @@ SiteNaming = Literal["desc", "none"]
 NamingScheme = Literal["blinded", "acq_blinded", "unblinded_validation"]
 NoiseCalibrationMode = Literal["excess_variance", "additive"]
 ContrastBackend = Literal["pchip_bloch"]
+BrainExtractionMode = Literal["auto", "evac", "morphological", "none"]
 
 
 def _default_modalities() -> list[Modality]:
@@ -197,18 +198,23 @@ class OptionalTemplateConfig(BaseModel):
 
 
 class ContrastConversionConfig(BaseModel):
-    """Tissue-aware continuous T1w -> T2w / EPI contrast conversion parameters.
+    """Tissue-aware continuous T1w -> T2w / FLAIR / EPI contrast conversion parameters.
 
-    `backend="pchip_bloch"` implements Options 1 + 2 (N4ITK + ICV/external mask +
-    monotone decreasing PCHIP transfer anchored to Bloch tissue signals).
+    `backend="pchip_bloch"` implements Options 1 + 2 (N4ITK + internal EVAC+/external brain
+    mask + PCHIP transfer anchored to Bloch tissue signals).
     Reserved extension hook for a future pretrained neural backend (Option 3).
     """
 
     backend: ContrastBackend = "pchip_bloch"
+    brain_extraction: BrainExtractionMode = "auto"
     n4_bias_correct: bool = True
     preserve_micro_texture: bool = True
     fat_retention_t2w: float = Field(default=0.65, ge=0.0, le=1.2)
-    fat_retention_epi: float = Field(default=0.12, ge=0.0, le=1.0)
+    fat_retention_flair: float = Field(default=0.35, ge=0.0, le=1.0)
+    fat_retention_epi: float = Field(default=0.0, ge=0.0, le=1.0)
+    epi_skull_strip: bool = True
+    epi_crop_to_brain: bool = True
+    epi_crop_pad_mm: float = Field(default=16.0, ge=0.0, le=60.0)
     brain_mask_suffix: str = "desc-brain_mask"
 
 

@@ -93,8 +93,30 @@ def resolve_encoding_axes(
     pe_raw = str(sidecar.get("PhaseEncodingDirection", "")).strip().lower()
     sl_raw = str(sidecar.get("SliceEncodingDirection", "")).strip().lower()
 
+    # Fallback: infer PE and slice axes from DICOM orientation metadata (common in 3D T1w sidecars)
+    inferred_pe: int | None = None
+    inferred_sl: int | None = None
+    iop = sidecar.get("ImageOrientationPatientDICOM")
+    dicom_pe = str(sidecar.get("InPlanePhaseEncodingDirectionDICOM", "")).strip().upper()
+    if isinstance(iop, list) and len(iop) == 6:
+        try:
+            row_vec = np.array([float(iop[0]), float(iop[1]), float(iop[2])], dtype=np.float64)
+            col_vec = np.array([float(iop[3]), float(iop[4]), float(iop[5])], dtype=np.float64)
+            sl_vec = np.cross(row_vec, col_vec)
+            # DICOM LPS axes map 1-to-1 by index to RAS axes (0=RL, 1=AP, 2=SI)
+            inferred_sl = int(np.argmax(np.abs(sl_vec)))
+            if dicom_pe == "ROW":
+                inferred_pe = int(np.argmax(np.abs(row_vec)))
+            elif dicom_pe == "COL":
+                inferred_pe = int(np.argmax(np.abs(col_vec)))
+        except (TypeError, ValueError):
+            inferred_pe = None
+            inferred_sl = None
+
     if pe_raw in axis_map:
         pe_axis = _map_axis(axis_map[pe_raw])
+    elif inferred_pe is not None:
+        pe_axis = inferred_pe
     elif modality in ("bold", "dwi"):
         pe_axis = 1  # Anterior-Posterior standard for EPI
     else:
@@ -103,6 +125,8 @@ def resolve_encoding_axes(
     if sl_raw in axis_map:
         mapped_sl = _map_axis(axis_map[sl_raw])
         slice_axis = mapped_sl if mapped_sl != pe_axis else (2 if pe_axis != 2 else 0)
+    elif inferred_sl is not None and inferred_sl != pe_axis:
+        slice_axis = inferred_sl
     else:
         slice_axis = 2 if pe_axis != 2 else 0
 

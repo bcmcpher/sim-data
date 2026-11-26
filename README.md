@@ -189,6 +189,21 @@ All artifacts map normalized severity $s \in [0, 1]$ monotonically to physical p
 
 ---
 
+## Getting Started Tutorial & End-to-End Verification
+
+To verify all working paths from **any single clean 3D T1w NIfTI** (modality conversion to `T2w`/`FLAIR`/`bold`/`dwi`, all 17 artifacts at low/mid/high severities, multi-site simulation, IQM sensitivity, harmonization audit, and visual QA contact sheets), see [tutorials/getting_started/README.md](tutorials/getting_started/README.md):
+
+```bash
+uv run --no-sync python tutorials/getting_started/run_all.py \
+  --t1w /path/to/clean_T1w.nii.gz \
+  --out-dir tutorial_output/my_run \
+  --workers 4
+```
+
+*(Pass `--use-phantom` to run end-to-end with zero external data.)*
+
+---
+
 ## Development & Quality Checks
 
 ```bash

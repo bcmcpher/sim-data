@@ -106,7 +106,7 @@ def _render_fmri_carpet_summary(
     zooms: tuple[float, float, float],
     path: Path,
 ) -> None:
-    """Render fMRIPrep-inspired BOLD summary: blind FD + std_dvars traces, carpet plot, and tSNR slice."""
+    """Render fMRIPrep-inspired BOLD summary: blind FD + std_dvars traces, tissue-grouped carpet plot, and tSNR slice."""
     mean_vol = np.mean(data_4d, axis=3)
     priors = compute_anatomical_priors(mean_vol)
     brain = priors.brain_mask
@@ -115,15 +115,51 @@ def _render_fmri_carpet_summary(
     fd = estimate_fd_proxy(data_4d, brain, zooms)
 
     ts = data_4d[brain].astype(np.float32)  # (V, T)
-    # Sample up to 600 voxels sorted by mean intensity (tissue proxy grouping: CSF/GM/WM)
     v_means = np.mean(ts, axis=1)
-    order = np.argsort(v_means)
-    if order.size > 600:
-        order = order[np.linspace(0, order.size - 1, 600).astype(int)]
+
+    # Group voxels into 3 T2*-weighted EPI tissue proxy bands:
+    # Brightest -> CSF (top ~20%), Mid -> Cortical GM (~45%), Darkest -> WM/Deep (~35%)
+    p35, p80 = np.percentile(v_means, [35.0, 80.0]) if v_means.size > 12 else (0.0, 1.0)
+    idx_gm = np.where((v_means >= p35) & (v_means < p80))[0]
+    idx_wm = np.where(v_means < p35)[0]
+    idx_csf = np.where(v_means >= p80)[0]
+
+    def _subsample_band(indices: np.ndarray, max_n: int) -> np.ndarray:
+        if indices.size == 0:
+            return indices
+        sorted_i = indices[np.argsort(v_means[indices])]
+        if sorted_i.size > max_n:
+            sorted_i = sorted_i[np.linspace(0, sorted_i.size - 1, max_n).astype(int)]
+        return sorted_i
+
+    gm_sel = _subsample_band(idx_gm, 270)
+    wm_sel = _subsample_band(idx_wm, 210)
+    csf_sel = _subsample_band(idx_csf, 120)
+    order = np.concatenate([gm_sel, wm_sel, csf_sel]) if (gm_sel.size + wm_sel.size + csf_sel.size) > 0 else np.arange(min(len(v_means), 600))
+    band_sizes = [int(gm_sel.size), int(wm_sel.size), int(csf_sel.size)]
+    band_labels = ["GM", "WM", "CSF"]
+    band_colors = np.array(
+        [
+            [0.89, 0.10, 0.11],  # GM - red
+            [0.22, 0.49, 0.72],  # WM - blue
+            [0.30, 0.69, 0.29],  # CSF - green
+        ],
+        dtype=np.float32,
+    )
+
     carpet = ts[order]
     c_mean = np.mean(carpet, axis=1, keepdims=True)
     c_std = np.std(carpet, axis=1, keepdims=True) + 1e-5
     carpet_z = np.clip((carpet - c_mean) / c_std, -3.0, 3.0)
+
+    # Color ribbon marking GM / WM / CSF bands on the y-axis
+    n_rows = carpet_z.shape[0]
+    ribbon = np.zeros((max(1, n_rows), 1, 3), dtype=np.float32)
+    cur = 0
+    for b_idx, sz in enumerate(band_sizes):
+        if sz > 0:
+            ribbon[cur : cur + sz, 0, :] = band_colors[b_idx]
+            cur += sz
 
     # Voxelwise tSNR midline axial map
     t_std = np.std(data_4d, axis=3) + 1e-5
@@ -131,29 +167,66 @@ def _render_fmri_carpet_summary(
     mid_z = (priors.bbox_min[2] + priors.bbox_max[2]) // 2
     tsnr_slice = _orient_slice_2d(tsnr_map[:, :, mid_z])
 
-    fig = plt.figure(figsize=(10, 6), dpi=110)
-    gs = fig.add_gridspec(3, 2, width_ratios=[2.6, 1.0], height_ratios=[1.0, 1.0, 2.2], hspace=0.35)
+    fig = plt.figure(figsize=(10.4, 6.2), dpi=110)
+    gs = fig.add_gridspec(
+        3,
+        3,
+        width_ratios=[0.12, 2.55, 1.05],
+        height_ratios=[1.0, 1.0, 2.3],
+        hspace=0.35,
+        wspace=0.06,
+    )
 
-    ax_fd = fig.add_subplot(gs[0, 0])
+    ax_fd = fig.add_subplot(gs[0, 1])
     ax_fd.plot(fd, color="#1f77b4", lw=1.2)
     ax_fd.axhline(0.2, color="#d62728", ls="--", lw=0.8, label="0.2 mm")
     ax_fd.set_ylabel("FD (mm)", fontsize=8)
-    ax_fd.set_title("fMRIPrep-Style BOLD QC Summary", fontsize=10)
+    ax_fd.set_title("fMRIPrep-Style BOLD QC Summary (Tissue-Grouped Carpet)", fontsize=10)
     ax_fd.tick_params(labelsize=7)
 
-    ax_dv = fig.add_subplot(gs[1, 0], sharex=ax_fd)
+    ax_dv = fig.add_subplot(gs[1, 1], sharex=ax_fd)
     ax_dv.plot(dvars_std, color="#ff7f0e", lw=1.2)
     ax_dv.set_ylabel("stdDVARS", fontsize=8)
     ax_dv.tick_params(labelsize=7)
 
-    ax_cp = fig.add_subplot(gs[2, 0], sharex=ax_fd)
+    ax_rib = fig.add_subplot(gs[2, 0])
+    ax_rib.imshow(ribbon, aspect="auto")
+    ax_rib.set_xticks([])
+    ticks: list[float] = []
+    tlabels: list[str] = []
+    pos = 0
+    for lbl, sz in zip(band_labels, band_sizes, strict=True):
+        if sz > 0:
+            ticks.append(pos + 0.5 * sz)
+            tlabels.append(lbl)
+            pos += sz
+    ax_rib.set_yticks(ticks)
+    ax_rib.set_yticklabels(tlabels, fontsize=8, fontweight="bold")
+    ax_rib.tick_params(length=0)
+
+    ax_cp = fig.add_subplot(gs[2, 1], sharex=ax_fd)
     ax_cp.imshow(carpet_z, aspect="auto", cmap="gray", vmin=-2.5, vmax=2.5)
-    ax_cp.set_ylabel("Voxels (tissue)", fontsize=8)
+    div = 0
+    for sz in band_sizes[:-1]:
+        if sz > 0:
+            div += sz
+            ax_cp.axhline(div - 0.5, color="#ffd166", lw=0.9, ls="--")
+    ax_cp.set_yticks([])
     ax_cp.set_xlabel("Volume (TR)", fontsize=8)
     ax_cp.tick_params(labelsize=7)
 
-    ax_tsnr = fig.add_subplot(gs[:, 1])
-    im = ax_tsnr.imshow(tsnr_slice, cmap="inferno", vmin=0, vmax=max(10.0, float(np.percentile(tsnr_slice[tsnr_slice > 0], 95)) if np.any(tsnr_slice > 0) else 20.0))
+    ax_tsnr = fig.add_subplot(gs[:, 2])
+    im = ax_tsnr.imshow(
+        tsnr_slice,
+        cmap="inferno",
+        vmin=0,
+        vmax=max(
+            10.0,
+            float(np.percentile(tsnr_slice[tsnr_slice > 0], 95))
+            if np.any(tsnr_slice > 0)
+            else 20.0,
+        ),
+    )
     ax_tsnr.set_title("Mid-Axial tSNR", fontsize=9)
     ax_tsnr.axis("off")
     fig.colorbar(im, ax=ax_tsnr, fraction=0.046, pad=0.04)

@@ -11,10 +11,73 @@ from dipy.core.gradients import gradient_table
 from dipy.denoise.noise_estimate import estimate_sigma, piesno
 
 from sim_data.io.orientation import compute_anatomical_priors
-from sim_data.iqm.functional import estimate_fd_proxy
 from sim_data.iqm.structural import compute_efc, compute_fwhm, compute_gsr
 
 _EPS = 1e-6
+
+
+def estimate_dwi_fd_proxy(
+    data_4d: np.ndarray,
+    brain_mask: np.ndarray,
+    zooms: tuple[float, float, float],
+    bvals: np.ndarray | None = None,
+) -> np.ndarray:
+    """Shell-aware blind framewise motion proxy (mm) for multi-shell 4D DWI.
+
+    Prevents cross-shell contrast jumps (b=0 -> b=1000 -> b=2000) and anisotropic WM
+    attenuation from masquerading as head motion by:
+    1. Computing per-volume clamped/normalized foreground envelopes (soft binary masks)
+       within a dilated brain support so rigid shifts/rotations move the envelope while
+       internal diffusion-weighting changes cancel out.
+    2. Comparing consecutive volumes within the same b-shell (bins of width 250 s/mm^2).
+    """
+    n_vols = data_4d.shape[3]
+    fd = np.zeros(n_vols, dtype=np.float32)
+    if n_vols < 2:
+        return fd
+
+    coords = np.argwhere(brain_mask).astype(np.float64)
+    if coords.shape[0] < 32:
+        return fd
+
+    zoom_arr = np.array(zooms, dtype=np.float64)[:, None]
+    centroid = np.mean(coords, axis=0)
+    raw = np.maximum(data_4d[brain_mask], 0.0).astype(np.float64)  # (V, T)
+
+    # Normalize each volume to a soft saturated foreground envelope in [0, 1]
+    p50 = np.percentile(raw, 50.0, axis=0, keepdims=True) + _EPS
+    norm_w = np.clip(raw / (0.65 * p50), 0.0, 1.0)
+
+    # Group volumes by rounded b-shell (0, 1000, 2000, ...) so transitions across shells are excluded
+    if bvals is not None and len(bvals) == n_vols:
+        shells = np.where(bvals <= 50.0, 0, np.rint(bvals / 250.0).astype(int) * 250)
+    else:
+        shells = np.zeros(n_vols, dtype=int)
+
+    half_coms: list[np.ndarray] = []
+    for axis in range(3):
+        for side_mask in (coords[:, axis] >= centroid[axis], coords[:, axis] < centroid[axis]):
+            if int(np.sum(side_mask)) < 16:
+                continue
+            c_sub = coords[side_mask]
+            w_sub = norm_w[side_mask]
+            w_sum = np.sum(w_sub, axis=0) + _EPS
+            com_mm = ((c_sub.T @ w_sub) / w_sum[None, :]) * zoom_arr  # (3, T)
+            half_coms.append(com_mm)
+
+    if not half_coms:
+        return fd
+
+    last_idx_by_shell: dict[int, int] = {}
+    for v in range(n_vols):
+        sh = int(shells[v])
+        if sh in last_idx_by_shell:
+            prev_v = last_idx_by_shell[sh]
+            disps = [float(np.sum(np.abs(com[:, v] - com[:, prev_v]))) for com in half_coms]
+            fd[v] = float(np.mean(disps))
+        last_idx_by_shell[sh] = v
+
+    return fd
 
 
 def compute_neighbor_dwi_corr(
@@ -207,8 +270,8 @@ def extract_diffusion_iqms(
     else:
         spikes_ppm = 0.0
 
-    # Strictly image-derived motion proxy (never reads simulation metadata)
-    fd_series = estimate_fd_proxy(arr, brain, zooms)
+    # Strictly image-derived shell-aware motion proxy (never reads simulation metadata)
+    fd_series = estimate_dwi_fd_proxy(arr, brain, zooms, bvals=bvals)
     mean_fd = float(np.mean(fd_series))
     max_fd = float(np.max(fd_series))
 

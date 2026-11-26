@@ -129,20 +129,29 @@ def synthesize_structural_modality(
     eff_affine = affine if affine is not None else np.eye(4, dtype=np.float64)
     comp_map = {"wm": pve.wm, "gm": pve.gm, "csf": pve.csf, "scalp": pve.scalp}
 
-    # For T2w without a paired real T2w, use continuous tissue-aware T1w -> T2w conversion
-    if modality == "T2w" and warped_t2 is None:
+    # For T2w or FLAIR without a paired real T2w, use continuous tissue-aware PCHIP/Bloch conversion
+    if modality in ("T2w", "FLAIR") and warped_t2 is None:
         converter = get_contrast_converter(contrast_cfg)
         conv = converter.convert(
             t1_data=warped_t1,
             affine=eff_affine,
-            target="T2w",
+            target=modality,
             params=params,
             cfg=contrast_cfg,
             brain_mask_array=brain_mask_array,
             seed=int(rng.integers(0, 2**31 - 1)),
         )
         signal = conv.data
-        sidecar_timing = {"RepetitionTime": 3.2, "EchoTime": 0.408}
+        if modality == "T2w":
+            sidecar_timing = {"RepetitionTime": 3.2, "EchoTime": 0.408}
+        else:
+            t1_csf = params.t1_ms["csf"]
+            ti_ms = float(t1_csf * np.log(2.0 / (1.0 + np.exp(-9000.0 / t1_csf))))
+            sidecar_timing = {
+                "RepetitionTime": 5.0,
+                "EchoTime": 0.388,
+                "InversionTime": round(ti_ms / 1000.0, 3),
+            }
         fg_med = (
             float(np.median(signal[conv.icv_mask]))
             if np.any(conv.icv_mask)
@@ -256,6 +265,37 @@ def _bandpass_timecourses(
     return np.asarray((filtered - np.mean(filtered, axis=1, keepdims=True)) / sd, dtype=np.float32)
 
 
+def _crop_epi_to_brain_fov(
+    data_4d: np.ndarray,
+    brain_mask: np.ndarray,
+    affine: np.ndarray,
+    pad_mm: float = 16.0,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Tightly crop a 4D EPI volume around its brain mask with air padding, updating affine origin."""
+    if not np.any(brain_mask) or pad_mm < 0.0:
+        return data_4d, affine
+    zooms = np.maximum(np.linalg.norm(affine[:3, :3], axis=0), 0.5)
+    coords = np.argwhere(brain_mask)
+    cmin = coords.min(axis=0)
+    cmax = coords.max(axis=0)
+    pad_vox = np.ceil(pad_mm / zooms).astype(int)
+
+    starts = np.maximum(0, cmin - pad_vox)
+    ends = np.minimum(np.array(brain_mask.shape, dtype=int), cmax + pad_vox + 1)
+    # Keep at least 16 voxels per axis so downstream FFT/FWHM/IQM kernels stay safe
+    for ax in range(3):
+        if int(ends[ax] - starts[ax]) < 16:
+            starts[ax] = 0
+            ends[ax] = brain_mask.shape[ax]
+
+    cropped = np.ascontiguousarray(
+        data_4d[starts[0] : ends[0], starts[1] : ends[1], starts[2] : ends[2], :]
+    )
+    new_affine = affine.copy()
+    new_affine[:3, 3] = affine[:3, 3] + affine[:3, :3] @ starts.astype(np.float64)
+    return cropped, new_affine
+
+
 def synthesize_bold_4d(
     pve: TissuePVEMaps,
     src_affine: np.ndarray,
@@ -267,8 +307,11 @@ def synthesize_bold_4d(
     rng: np.random.Generator,
     device: str = "auto",
     t2_base_vol: np.ndarray | None = None,
-    fat_retention_epi: float = 0.12,
+    fat_retention_epi: float = 0.0,
     t2_base_is_fat_suppressed: bool = False,
+    epi_skull_strip: bool = True,
+    epi_crop_to_brain: bool = True,
+    epi_crop_pad_mm: float = 16.0,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Synthesize a clean 4D BOLD EPI timeseries sequentially from high-res T2w/T2* contrast."""
     epi_pve, epi_affine = _resample_pve_to_spacing(pve, src_affine, src_zooms, cfg.voxel_size_mm)
@@ -283,16 +326,23 @@ def synthesize_bold_4d(
             t2_base_vol, src_affine, src_zooms, cfg.voxel_size_mm, target_spec=target_spec
         )
         s0 = np.maximum(s0, 0.0).astype(np.float32)
-        if not t2_base_is_fat_suppressed:
-            # Apply EPI fat suppression on extracranial scalp when sourced from clinical FSE T2w
+        if epi_skull_strip:
+            # Strip extracranial scalp/skull/neck so BOLD reflects brain-only EPI acquisition
+            soft_brain = ndimage.gaussian_filter(epi_pve.brain_mask.astype(np.float32), sigma=0.5)
+            s0 = np.where(epi_pve.brain_mask, s0, s0 * np.clip(soft_brain, 0.0, 0.35)).astype(
+                np.float32
+            )
+            s0[~ndimage.binary_dilation(epi_pve.brain_mask, iterations=1)] = 0.0
+        elif not t2_base_is_fat_suppressed:
             s0 = s0 * (1.0 - (1.0 - fat_retention_epi) * epi_pve.scalp)
     else:
         s0 = np.zeros(shape, dtype=np.float32)
+        scalp_w = 0.0 if epi_skull_strip else 0.45
         for name, frac in [
             ("wm", epi_pve.wm),
             ("gm", epi_pve.gm),
             ("csf", epi_pve.csf),
-            ("scalp", epi_pve.scalp * 0.45),
+            ("scalp", epi_pve.scalp * scalp_w),
         ]:
             s0 += frac * float(params.rho[name] * np.exp(-te_ms / params.t2s_ms[name]))
 
@@ -382,6 +432,10 @@ def synthesize_bold_4d(
         seed=int(rng.integers(0, 2**31 - 1)),
         device=resolve_device(device),
     )
+    if epi_crop_to_brain:
+        bold_4d, epi_affine = _crop_epi_to_brain_fov(
+            bold_4d, epi_pve.brain_mask, epi_affine, pad_mm=epi_crop_pad_mm
+        )
     return bold_4d, epi_affine
 
 
@@ -459,8 +513,11 @@ def synthesize_dwi_4d(
     rng: np.random.Generator,
     device: str = "auto",
     t2_base_vol: np.ndarray | None = None,
-    fat_retention_epi: float = 0.12,
+    fat_retention_epi: float = 0.0,
     t2_base_is_fat_suppressed: bool = False,
+    epi_skull_strip: bool = True,
+    epi_crop_to_brain: bool = True,
+    epi_crop_pad_mm: float = 16.0,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Synthesize clean multi-shell 4D DWI sequentially from high-res T2w/b=0 contrast."""
     src_shape = (int(pve.wm.shape[0]), int(pve.wm.shape[1]), int(pve.wm.shape[2]))
@@ -524,15 +581,22 @@ def synthesize_dwi_4d(
             t2_base_vol, src_affine, src_zooms, cfg.voxel_size_mm, target_spec=target_spec
         )
         s0 = np.maximum(s0, 0.0).astype(np.float32)
-        if not t2_base_is_fat_suppressed:
+        if epi_skull_strip:
+            soft_brain = ndimage.gaussian_filter(dwi_pve.brain_mask.astype(np.float32), sigma=0.5)
+            s0 = np.where(dwi_pve.brain_mask, s0, s0 * np.clip(soft_brain, 0.0, 0.35)).astype(
+                np.float32
+            )
+            s0[~ndimage.binary_dilation(dwi_pve.brain_mask, iterations=1)] = 0.0
+        elif not t2_base_is_fat_suppressed:
             s0 = s0 * (1.0 - (1.0 - fat_retention_epi) * dwi_pve.scalp)
     else:
         s0 = np.zeros(dwi_shape, dtype=np.float32)
+        scalp_w = 0.0 if epi_skull_strip else 0.35
         for name, frac in [
             ("wm", dwi_pve.wm),
             ("gm", dwi_pve.gm),
             ("csf", dwi_pve.csf),
-            ("scalp", dwi_pve.scalp * 0.35),
+            ("scalp", dwi_pve.scalp * scalp_w),
         ]:
             s0 += frac * float(params.rho[name] * np.exp(-te_ms / params.t2_ms[name]))
 
@@ -582,4 +646,8 @@ def synthesize_dwi_4d(
         seed=int(rng.integers(0, 2**31 - 1)),
         device=dev,
     )
+    if epi_crop_to_brain:
+        dwi_4d, dwi_affine = _crop_epi_to_brain_fov(
+            dwi_4d, dwi_pve.brain_mask, dwi_affine, pad_mm=epi_crop_pad_mm
+        )
     return dwi_4d, dwi_affine, bvals, bvecs

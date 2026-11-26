@@ -273,6 +273,7 @@ def run_sensitivity_analysis(
                     "std_spearman_rho": round(st["std_spearman_rho"], 4),
                     "standardized_slope": round(st["standardized_slope"], 4),
                     "max_effect_cohens_d": round(st["max_effect_cohens_d"], 4),
+                    "abs_max_d": round(abs(float(st["max_effect_cohens_d"])), 4),
                     "min_detectable_severity": (
                         round(float(st["min_detectable_severity"]), 4)
                         if st["min_detectable_severity"] is not None
@@ -283,8 +284,8 @@ def run_sensitivity_analysis(
             )
 
     summary_df = pd.DataFrame(summary_rows).sort_values(
-        by=["target_artifact", "abs_mean_rho", "specificity_ratio"],
-        ascending=[True, False, False],
+        by=["target_artifact", "abs_mean_rho", "abs_max_d", "specificity_ratio"],
+        ascending=[True, False, False, False],
     ).reset_index(drop=True)
 
     matrix_df = summary_df.pivot(

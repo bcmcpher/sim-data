@@ -110,16 +110,26 @@ def compute_fidelity_metrics(
     nrmse = float(np.sqrt(mse))
     psnr = float(min(60.0, 20.0 * np.log10(1.0 / max(nrmse, 1e-4))))
 
+    mid_x = (clean_priors.bbox_min[0] + clean_priors.bbox_max[0]) // 2
+    mid_y = (clean_priors.bbox_min[1] + clean_priors.bbox_max[1]) // 2
     mid_z = (clean_priors.bbox_min[2] + clean_priors.bbox_max[2]) // 2
-    sl_r = r_norm[:, :, mid_z]
-    sl_c = c_norm[:, :, mid_z]
-    win = min(7, sl_r.shape[0], sl_r.shape[1])
-    if win % 2 == 0:
-        win = max(3, win - 1)
-    try:
-        ssim_val = float(ssim(sl_r, sl_c, data_range=2.0, win_size=win))
-    except Exception:
-        ssim_val = 0.0
+    plane_pairs = [
+        (r_norm[:, :, mid_z], c_norm[:, :, mid_z]),
+        (r_norm[:, mid_y, :], c_norm[:, mid_y, :]),
+        (r_norm[mid_x, :, :], c_norm[mid_x, :, :]),
+    ]
+    plane_ssims: list[float] = []
+    for sl_r, sl_c in plane_pairs:
+        win = min(7, sl_r.shape[0], sl_r.shape[1])
+        if win % 2 == 0:
+            win = max(3, win - 1)
+        if win < 3:
+            continue
+        try:
+            plane_ssims.append(float(ssim(sl_r, sl_c, data_range=2.0, win_size=win)))
+        except Exception:
+            pass
+    ssim_val = float(np.mean(plane_ssims)) if plane_ssims else 0.0
 
     thresh_alive = 0.05 * c_scale
     retention = float(np.mean(cur[mask] > thresh_alive))

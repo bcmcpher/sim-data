@@ -99,7 +99,19 @@ def apply_site_pre_profile(
         else:
             arr = np.asarray(out_t, dtype=np.float32) * ref_scale
 
-    arr = np.maximum(arr * gain + offset * ref_scale, 0.0)
+    if abs(offset) > 1e-5:
+        # Apply intensity offset smoothly inside foreground so background air stays free of a flat DC pedestal
+        fg_soft = ndimage.gaussian_filter(
+            ndimage.binary_dilation(ctx.priors.brain_mask, iterations=2).astype(np.float32),
+            sigma=2.0,
+        )
+        fg_soft = np.clip(fg_soft, 0.0, 1.0)
+        if arr.ndim == 4:
+            arr = np.maximum(arr * gain + (offset * ref_scale) * fg_soft[..., None], 0.0)
+        else:
+            arr = np.maximum(arr * gain + (offset * ref_scale) * fg_soft, 0.0)
+    else:
+        arr = np.maximum(arr * gain, 0.0)
 
     if any(s > 0.05 for s in psf):
         if arr.ndim == 4:

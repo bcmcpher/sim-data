@@ -120,3 +120,30 @@ def test_flair_polarity_aware_texture_preserves_csf_suppression_and_gm_gt_wm(
     csf_pure = pve.csf > 0.6
     assert float(np.median(flair[gm_pure])) > float(np.median(flair[wm_pure]))
     assert float(np.median(flair[csf_pure])) < float(np.median(flair[gm_pure]))
+
+
+def test_standalone_flair_pchip_conversion_nulls_csf_and_keeps_gm_above_wm(
+    bids_phantom_dir: Path,
+) -> None:
+    t1_scan = discover_bids_scans(bids_phantom_dir, modalities=["T1w"])[0]
+    loaded = load_bids_scan(t1_scan)
+    t1_data, affine, _ = canonicalize_to_ras(loaded.img)
+
+    res = invert_t1w_to_t2w(
+        t1_data,
+        affine=affine,
+        target="FLAIR",
+        cfg=ContrastConversionConfig(n4_bias_correct=True, brain_extraction="morphological"),
+        seed=42,
+    )
+    assert res.data.shape == t1_data.shape
+    assert np.all(np.isfinite(res.data))
+    icv = res.icv_mask
+    t1_icv = res.t1_n4[icv]
+    fl_icv = res.data[icv]
+    p15, p45, p65, p88 = np.percentile(t1_icv, [15.0, 45.0, 65.0, 88.0])
+    csf_med = float(np.median(fl_icv[t1_icv <= p15]))
+    gm_med = float(np.median(fl_icv[(t1_icv >= p45) & (t1_icv <= p65)]))
+    wm_med = float(np.median(fl_icv[t1_icv >= p88]))
+    assert gm_med > wm_med > csf_med
+    assert csf_med < 0.45 * gm_med

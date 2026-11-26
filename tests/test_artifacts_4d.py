@@ -127,3 +127,20 @@ def test_dwi_eddy_currents_runs_cleanly(bids_phantom_dir: Path) -> None:
     assert rec.params["affected_volumes"] > 0
     assert ctx.data.shape == orig.shape
     assert float(np.mean(np.abs(ctx.data - orig))) > 0.5
+
+
+def test_dwi_shell_aware_fd_is_low_when_stationary_and_rises_with_motion_4d(
+    bids_phantom_dir: Path,
+) -> None:
+    ctx_clean = _make_4d_context(bids_phantom_dir, "dwi", seed=70)
+    iqm_clean = extract_diffusion_iqms(
+        ctx_clean.data, ctx_clean.zooms, bvals=ctx_clean.bvals, bvecs=ctx_clean.bvecs
+    )
+    assert iqm_clean["mean_fd"] < 0.35
+
+    ctx_mot = _make_4d_context(bids_phantom_dir, "dwi", seed=70)
+    create_artifact("motion_4d", severity=0.80).apply(ctx_mot)
+    iqm_mot = extract_diffusion_iqms(
+        ctx_mot.data, ctx_mot.zooms, bvals=ctx_mot.bvals, bvecs=ctx_mot.bvecs
+    )
+    assert iqm_mot["mean_fd"] > iqm_clean["mean_fd"] + 0.25

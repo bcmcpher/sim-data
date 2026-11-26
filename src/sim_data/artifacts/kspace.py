@@ -13,8 +13,9 @@ from sim_data.artifacts.base import BaseArtifactTransform, PipelineStage, ScanCo
 class WrapAround(BaseArtifactTransform):
     """Phase-encoding FOV fold-over (aliasing / wrap-around) artifact.
 
-    Simulates an undersized phase-encoding FOV by cropping a reduced-FOV band
-    and folding peripheral anatomy circularly onto the opposite side of the FOV.
+    Models an undersized phase-encoding FOV of width `fov_len < brain_span` by
+    aliasing peripheral anatomy circularly onto the opposite side of the reduced FOV
+    with smooth raised-cosine edge falloff (no artificial interior step seam).
     """
 
     name = "wrap_around"
@@ -26,45 +27,52 @@ class WrapAround(BaseArtifactTransform):
         axis = int(self.params.get("axis", ctx.pe_axis))
         dim_len = ctx.spatial_shape[axis]
 
-        # Fraction of brain span that wraps onto opposite side of FOV
         bmin, bmax = ctx.priors.bbox_min[axis], ctx.priors.bbox_max[axis]
         brain_span = max(8, bmax - bmin + 1)
-        wrap_frac = float(self.params.get("wrap_fraction", 0.08 + 0.28 * self.severity))
-        shift_vox = max(2, int(round(brain_span * wrap_frac)))
+        wrap_frac = float(self.params.get("wrap_fraction", 0.08 + 0.24 * self.severity))
+        shift_vox = max(2, min(brain_span // 2, int(round(brain_span * wrap_frac))))
         direction = int(self.params.get("direction", int(ctx.rng.choice([-1, 1]))))
-        blend_gain = float(self.params.get("blend_gain", 0.45 + 0.50 * self.severity))
+        blend_gain = float(self.params.get("blend_gain", 0.50 + 0.45 * self.severity))
 
+        # Reduced PE FOV length: peripheral overhang of width `shift_vox` aliases modulo `fov_len`
+        fov_len = max(8, brain_span - shift_vox)
         arr = ctx.data
-        # Extract the peripheral brain slab on one side and fold it circularly to the opposite side
         moved = np.moveaxis(arr, axis, 0)
         out = moved.copy()
 
+        # Smooth cosine taper across the wrapped overhang (avoids sharp interior step seam)
+        taper = 0.5 * (1.0 - np.cos(np.linspace(0.0, np.pi, shift_vox, dtype=np.float32)))
+        taper = (0.35 + 0.65 * taper).reshape((shift_vox,) + (1,) * (moved.ndim - 1))
+
         if direction > 0:
-            # High-index peripheral anatomy folds onto low-index side
+            # High-index peripheral anatomy folds circularly onto low-index side of reduced FOV
             src_start = max(0, bmax - shift_vox + 1)
-            slab = moved[src_start : bmax + 1].copy()
-            slab_len = slab.shape[0]
-            dst_start = max(0, bmin - max(1, slab_len // 3))
-            dst_end = min(dim_len, dst_start + slab_len)
-            copy_len = dst_end - dst_start
-            # Taper outer edge slightly for realistic coil sensitivity roll-off
-            taper = np.linspace(0.75, 1.0, copy_len, dtype=np.float32)
-            taper = taper.reshape((copy_len,) + (1,) * (moved.ndim - 1))
-            out[dst_start:dst_end] = out[dst_start:dst_end] + blend_gain * slab[:copy_len] * taper
-            # Also attenuate/crop the wrapped source region slightly to mimic truncated FOV
-            out[src_start : bmax + 1] *= float(max(0.15, 1.0 - 0.65 * self.severity))
+            src_end = min(dim_len, src_start + shift_vox)
+            slab = moved[src_start:src_end].copy()
+            copy_len = slab.shape[0]
+            dst_start = max(0, src_start - fov_len)
+            dst_end = min(dim_len, dst_start + copy_len)
+            eff_len = dst_end - dst_start
+            if eff_len > 0:
+                t_eff = taper[:eff_len]
+                out[dst_start:dst_end] = out[dst_start:dst_end] + blend_gain * slab[:eff_len] * t_eff
+                # Smoothly crop/zero the out-of-FOV peripheral overhang beyond the reduced FOV edge
+                edge_keep = (1.0 - t_eff * float(np.clip(0.35 + 0.65 * self.severity, 0.0, 1.0)))
+                out[src_start : src_start + eff_len] = out[src_start : src_start + eff_len] * edge_keep
         else:
-            # Low-index peripheral anatomy folds onto high-index side
-            src_end = min(dim_len, bmin + shift_vox)
-            slab = moved[bmin:src_end].copy()
-            slab_len = slab.shape[0]
-            dst_end = min(dim_len, bmax + max(1, slab_len // 3) + 1)
-            dst_start = max(0, dst_end - slab_len)
-            copy_len = dst_end - dst_start
-            taper = np.linspace(1.0, 0.75, copy_len, dtype=np.float32)
-            taper = taper.reshape((copy_len,) + (1,) * (moved.ndim - 1))
-            out[dst_start:dst_end] = out[dst_start:dst_end] + blend_gain * slab[-copy_len:] * taper
-            out[bmin:src_end] *= float(max(0.15, 1.0 - 0.65 * self.severity))
+            # Low-index peripheral anatomy folds circularly onto high-index side of reduced FOV
+            src_start = max(0, bmin)
+            src_end = min(dim_len, src_start + shift_vox)
+            slab = moved[src_start:src_end].copy()
+            copy_len = slab.shape[0]
+            dst_start = min(dim_len - 1, src_start + fov_len)
+            dst_end = min(dim_len, dst_start + copy_len)
+            eff_len = dst_end - dst_start
+            if eff_len > 0:
+                t_eff = taper[-eff_len:][::-1]
+                out[dst_start:dst_end] = out[dst_start:dst_end] + blend_gain * slab[:eff_len] * t_eff
+                edge_keep = (1.0 - t_eff * float(np.clip(0.35 + 0.65 * self.severity, 0.0, 1.0)))
+                out[src_start : src_start + eff_len] = out[src_start : src_start + eff_len] * edge_keep
 
         ctx.data = np.ascontiguousarray(np.moveaxis(out, 0, axis))
         return {
@@ -73,6 +81,7 @@ class WrapAround(BaseArtifactTransform):
             "direction": direction,
             "wrap_fraction": round(wrap_frac, 4),
             "shift_vox": shift_vox,
+            "fov_len": fov_len,
             "blend_gain": round(blend_gain, 3),
         }
 

@@ -42,7 +42,12 @@ def _run_torchio_transform(
 
 
 class Motion3D(BaseArtifactTransform):
-    """3D k-space intra-scan rigid head motion via TorchIO RandomMotion."""
+    """3D k-space intra-scan rigid head motion via deterministic CRN-scaled TorchIO Motion.
+
+    Pre-samples unit rotation/translation directions and sorted k-space segment times from
+    `ctx.rng`, then scales pose amplitudes strictly monotonically with `severity` so coupled
+    dose trajectories progress smoothly from mild blur/ghosting to severe clinical ringing.
+    """
 
     name = "motion_3d"
     stage = PipelineStage.KSPACE
@@ -50,27 +55,44 @@ class Motion3D(BaseArtifactTransform):
     qc_weight = 1.15
 
     def _apply_impl(self, ctx: ScanContext) -> dict[str, Any]:
-        degrees = float(self.params.get("degrees", 1.5 + 11.5 * self.severity))
-        translation = float(self.params.get("translation", 1.5 + 10.5 * self.severity))
-        default_n = 4 if ctx.coupled_trajectory else max(2, int(round(2 + 5 * self.severity)))
+        max_deg = float(self.params.get("degrees", 1.8 + 14.2 * (self.severity**1.15)))
+        max_trans = float(self.params.get("translation", 1.2 + 10.8 * (self.severity**1.15)))
+        default_n = 4 if ctx.coupled_trajectory else max(2, int(round(2 + 4 * self.severity)))
         num_transforms = int(self.params.get("num_transforms", default_n))
 
-        tfm = tio.RandomMotion(
-            degrees=degrees,
-            translation=translation,
-            num_transforms=num_transforms,
+        # Pre-sample CRN unit pose directions & sorted transition times spanning central k-space
+        signs_r = ctx.rng.choice([-1.0, 1.0], size=(num_transforms, 3))
+        mags_r = ctx.rng.uniform(0.45, 1.0, size=(num_transforms, 3))
+        signs_t = ctx.rng.choice([-1.0, 1.0], size=(num_transforms, 3))
+        mags_t = ctx.rng.uniform(0.45, 1.0, size=(num_transforms, 3))
+        raw_times = np.sort(ctx.rng.uniform(0.18, 0.84, size=num_transforms))
+        # Guarantee at least one movement hits the central k-space energy band (0.38..0.62)
+        mid_slot = num_transforms // 2
+        raw_times[mid_slot] = float(ctx.rng.uniform(0.40, 0.60))
+        times = np.sort(np.clip(raw_times, 0.12, 0.88))
+
+        degrees_arr = signs_r * mags_r * max_deg
+        trans_arr = signs_t * mags_t * max_trans
+
+        tfm = tio.Motion(
+            degrees=degrees_arr,
+            translation=trans_arr,
+            times=times,
             image_interpolation="linear",
-            p=1.0,
         )
         ctx.data = np.maximum(
             _run_torchio_transform(tfm, ctx.data, ctx.affine, seed=ctx.spawn_seed()),
             0.0,
         )
+        ctx.metadata["gt_motion3d_degrees"] = np.round(degrees_arr, 3).tolist()
+        ctx.metadata["gt_motion3d_translation_mm"] = np.round(trans_arr, 3).tolist()
+        ctx.metadata["gt_motion3d_times"] = [round(float(t), 4) for t in times]
         return {
-            "engine": "torchio.RandomMotion",
-            "degrees": round(degrees, 3),
-            "translation_mm": round(translation, 3),
+            "engine": "torchio.Motion",
+            "degrees": round(max_deg, 3),
+            "translation_mm": round(max_trans, 3),
             "num_transforms": num_transforms,
+            "times": [round(float(t), 3) for t in times],
         }
 
 

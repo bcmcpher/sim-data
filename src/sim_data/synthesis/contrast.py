@@ -1,17 +1,17 @@
-"""Tissue-aware continuous T1w -> T2w / EPI contrast conversion (Options 1 + 2, Option 3 protocol).
+"""Tissue-aware continuous T1w -> T2w / FLAIR / EPI contrast conversion.
 
-Converts a clean T1w volume into a T2w, T2*-weighted BOLD S0, or SE-EPI DWI b=0 baseline while:
+Converts a clean T1w volume into T2w, CSF-nulled FLAIR, T2*-weighted BOLD S0, or
+SE-EPI DWI b=0 contrast while:
 1. Correcting smooth B1 bias via SimpleITK N4ITK so tissue intensities are spatially stationary.
-2. Separating intracranial volume (ICV) from cortical skull bone/air and outer scalp/fat
-   (using an optional external brain mask when provided, or morphological ICV fallback).
-3. Mapping intracranial intensities continuously through a strictly monotone decreasing
-   PchipInterpolator anchored to GMM tissue modes (CSF, GM, WM) and Bloch target contrasts,
-   preserving continuous sulcal/gyral micro-texture with proper inverted polarity.
-4. Retaining air and skull bone dark while controlling scalp fat independently (retained for
-   clinical FSE T2w; fat-suppressed for EPI BOLD and DWI).
-
-Extension note (Option 3): Implement `ContrastConverter` to plug in a pretrained neural
-T1w -> T2w backend (e.g., SynthSR / MONAI) once formal clinical validation begins.
+2. Separating intracranial brain volume (ICV) from cortical skull bone/air and outer scalp/neck
+   using an external brain mask (Option 2), DIPY's PyTorch EVAC+ extractor (`brain_extraction="auto"`),
+   or an offline morphological ICV fallback.
+3. Mapping intracranial intensities continuously through a shape-preserving PchipInterpolator
+   anchored to GMM tissue modes (CSF, GM, WM) and Bloch target contrasts:
+   - `T2w`, `bold_s0`, `dwi_b0`: strictly monotone decreasing (CSF > GM > WM).
+   - `FLAIR`: unimodal CSF-nulled curve (GM > WM >> CSF ~ 0).
+4. Retaining air and skull bone dark, retaining scalp fat on clinical structural scans (`T2w`,
+   `FLAIR`), and cleanly skull-stripping / fat-suppressing EPI baselines (`bold_s0`, `dwi_b0`).
 """
 
 from __future__ import annotations
@@ -26,34 +26,32 @@ from scipy import ndimage
 from scipy.interpolate import PchipInterpolator
 from sklearn.mixture import GaussianMixture
 
-from sim_data.config import ContrastConversionConfig
+from sim_data.config import BrainExtractionMode, ContrastConversionConfig
 from sim_data.io.orientation import compute_anatomical_priors
-from sim_data.synthesis.tissue import (
-    TissueMRIParams,
-    resample_nifti_to_grid,
-    sample_tissue_mri_params,
-)
+from sim_data.synthesis.brain_mask import extract_brain_mask
+from sim_data.synthesis.tissue import TissueMRIParams, sample_tissue_mri_params
 
-ContrastTarget = Literal["T2w", "bold_s0", "dwi_b0"]
+ContrastTarget = Literal["T2w", "FLAIR", "bold_s0", "dwi_b0"]
 
 
 @dataclass
 class ContrastConversionResult:
-    """Output of T1w -> T2w-like contrast conversion with compartment masks and diagnostics."""
+    """Output of T1w -> T2w/FLAIR/EPI contrast conversion with compartment masks and diagnostics."""
 
     data: np.ndarray  # float32 (X, Y, Z)
-    icv_mask: np.ndarray  # bool (X, Y, Z) intracranial volume
+    icv_mask: np.ndarray  # bool (X, Y, Z) intracranial brain volume
     bone_air_mask: np.ndarray  # bool (X, Y, Z) air + cortical bone kept dark
-    scalp_mask: np.ndarray  # bool (X, Y, Z) extracranial scalp/fat
+    scalp_mask: np.ndarray  # bool (X, Y, Z) extracranial scalp/fat/neck
     t1_n4: np.ndarray  # float32 (X, Y, Z) N4-corrected T1w
     tissue_anchors_t1: dict[str, float]  # normalized T1w GMM means for csf/gm/wm
     tissue_targets_out: dict[str, float]  # Bloch target signals for csf/gm/wm
     used_external_mask: bool
     backend: str
+    mask_method: str = "morphological"
 
 
 class ContrastConverter(Protocol):
-    """Protocol for T1w -> T2w-like contrast converters (pchip_bloch now; neural in Option 3)."""
+    """Protocol for T1w -> T2w/FLAIR/EPI contrast converters (pchip_bloch now; neural in Option 3)."""
 
     def convert(
         self,
@@ -67,7 +65,7 @@ class ContrastConverter(Protocol):
         te_ms: float | None = None,
         seed: int = 42,
     ) -> ContrastConversionResult:
-        """Convert a 3D RAS+ T1w volume into the requested T2-like contrast."""
+        """Convert a 3D RAS+ T1w volume into the requested target contrast."""
 
 
 def n4_bias_correct_volume(
@@ -122,61 +120,17 @@ def resolve_icv_and_compartments(
     affine: np.ndarray,
     brain_mask_path: str | Path | None = None,
     brain_mask_array: np.ndarray | None = None,
+    method: BrainExtractionMode = "auto",
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, bool]:
-    """Separate intracranial volume (ICV), dark skull/air, and outer scalp/fat.
-
-    Uses an explicit brain/ICV mask when supplied (Option 2), otherwise falls back to
-    morphological + intensity-guided cranial compartment separation.
-    """
-    shape = (int(t1_corr.shape[0]), int(t1_corr.shape[1]), int(t1_corr.shape[2]))
-    priors = compute_anatomical_priors(t1_corr)
-    head_mask = priors.brain_mask
-
-    if brain_mask_array is not None and brain_mask_array.shape == shape:
-        icv_mask = np.asarray(brain_mask_array > 0.5, dtype=bool)
-        used_external = True
-    elif brain_mask_path is not None:
-        raw_mask = resample_nifti_to_grid(brain_mask_path, shape, affine, order=0)
-        if raw_mask.ndim == 4:
-            raw_mask = raw_mask[..., 0]
-        icv_mask = np.asarray(raw_mask > 0.5, dtype=bool)
-        used_external = True
-    else:
-        used_external = False
-        eroded = ndimage.binary_erosion(head_mask, iterations=2)
-        outer_rim = head_mask & (~eroded)
-        if int(eroded.sum()) < 64:
-            icv_mask = head_mask.copy()
-            scalp_mask = np.zeros(shape, dtype=bool)
-            bone_air_mask = ~icv_mask
-            return icv_mask, bone_air_mask, scalp_mask, False
-
-        inner_vals = t1_corr[eroded]
-        p15 = float(np.percentile(inner_vals, 15.0))
-        p50 = float(np.percentile(inner_vals, 50.0))
-        p97 = float(np.percentile(inner_vals, 97.0))
-
-        # Outer cranial shell: moderate-to-low T1 scalp/marrow OR hyperintense subcutaneous fat
-        scalp_cand = outer_rim & ((t1_corr >= p15 * 0.45) & (t1_corr < p50 * 0.92) | (t1_corr > p97))
-        dark_bone = outer_rim & (t1_corr < p15 * 0.45)
-        icv_mask = head_mask & (~scalp_cand) & (~dark_bone)
-        if int(icv_mask.sum()) < 64:
-            icv_mask = eroded
-        scalp_mask = scalp_cand
-        bone_air_mask = (~icv_mask) & (~scalp_mask)
-        return icv_mask, bone_air_mask, scalp_mask, False
-
-    if int(icv_mask.sum()) < 32:
-        icv_mask = head_mask.copy()
-
-    outer_shell = head_mask & (~icv_mask)
-    if np.any(outer_shell):
-        icv_p20 = float(np.percentile(t1_corr[icv_mask], 20.0))
-        scalp_mask = outer_shell & (t1_corr >= icv_p20 * 0.40)
-    else:
-        scalp_mask = np.zeros(shape, dtype=bool)
-    bone_air_mask = (~icv_mask) & (~scalp_mask)
-    return icv_mask, bone_air_mask, scalp_mask, used_external
+    """Separate intracranial volume (ICV), dark skull/air, and outer scalp/fat."""
+    res = extract_brain_mask(
+        t1_corr=t1_corr,
+        affine=affine,
+        method=method,
+        brain_mask_path=brain_mask_path,
+        brain_mask_array=brain_mask_array,
+    )
+    return res.icv_mask, res.bone_air_mask, res.scalp_mask, res.used_external_mask
 
 
 def _bloch_target_intensities(
@@ -184,8 +138,22 @@ def _bloch_target_intensities(
     params: TissueMRIParams,
     te_ms: float | None = None,
 ) -> dict[str, float]:
-    """Compute physical Bloch target signals for CSF, GM, WM for T2w / BOLD S0 / DWI b=0."""
+    """Compute physical Bloch target signals for CSF, GM, WM for T2w / FLAIR / BOLD S0 / DWI b=0."""
     out: dict[str, float] = {}
+    if target == "FLAIR":
+        tr = 9000.0
+        te = 110.0 if te_ms is None else float(te_ms)
+        t1_csf = params.t1_ms["csf"]
+        ti = float(t1_csf * np.log(2.0 / (1.0 + np.exp(-tr / t1_csf))))
+        for name in ("csf", "gm", "wm"):
+            ir = abs(1.0 - 2.0 * np.exp(-ti / params.t1_ms[name]) + np.exp(-tr / params.t1_ms[name]))
+            out[name] = float(params.rho[name] * ir * np.exp(-te / params.t2_ms[name]))
+        # Enforce clinical FLAIR contrast: bright GM > mid-gray WM >> dark nulled CSF
+        s_gm = max(out["gm"], 0.25)
+        s_wm = min(max(out["wm"], s_gm * 0.58), s_gm * 0.72)
+        s_csf = min(max(out["csf"], 0.01), s_gm * 0.08)
+        return {"csf": s_csf, "gm": s_gm, "wm": s_wm}
+
     if target == "T2w":
         tr = 4500.0
         te = 100.0 if te_ms is None else float(te_ms)
@@ -222,13 +190,7 @@ def invert_t1w_to_t2w(
     te_ms: float | None = None,
     seed: int = 42,
 ) -> ContrastConversionResult:
-    """Convert a 3D RAS+ T1w image into continuous T2w / BOLD S0 / DWI b=0 contrast.
-
-    Uses N4ITK bias correction + ICV/bone/scalp compartment separation + strictly monotone
-    decreasing PCHIP spline anchored to GMM tissue modes (CSF, GM, WM) and Bloch target
-    intensities. Preserves fine sulcal/gyral micro-texture with inverted polarity while
-    keeping background air and cortical bone dark.
-    """
+    """Convert a 3D RAS+ T1w image into continuous T2w / FLAIR / BOLD S0 / DWI b=0 contrast."""
     cfg = cfg or ContrastConversionConfig()
     rng = np.random.default_rng(seed)
     params = params or sample_tissue_mri_params(rng, jitter=0.0)
@@ -238,12 +200,17 @@ def invert_t1w_to_t2w(
         t1 = t1[..., 0]
 
     t1_corr = n4_bias_correct_volume(t1) if cfg.n4_bias_correct else t1.copy()
-    icv_mask, bone_air_mask, scalp_mask, used_ext = resolve_icv_and_compartments(
-        t1_corr,
+    mask_res = extract_brain_mask(
+        t1_corr=t1_corr,
         affine=affine,
+        method=cfg.brain_extraction,
         brain_mask_path=brain_mask_path,
         brain_mask_array=brain_mask_array,
     )
+    icv_mask = mask_res.icv_mask
+    bone_air_mask = mask_res.bone_air_mask
+    scalp_mask = mask_res.scalp_mask
+    used_ext = mask_res.used_external_mask
 
     icv_vals = t1_corr[icv_mask]
     if icv_vals.size < 32 or float(np.max(icv_vals)) <= 1e-6:
@@ -257,6 +224,7 @@ def invert_t1w_to_t2w(
             tissue_targets_out={"csf": 1.0, "gm": 0.7, "wm": 0.45},
             used_external_mask=used_ext,
             backend=cfg.backend,
+            mask_method=mask_res.method,
         )
 
     p98 = max(float(np.percentile(icv_vals, 98.0)), 1e-5)
@@ -289,44 +257,68 @@ def invert_t1w_to_t2w(
     targets = _bloch_target_intensities(target, params, te_ms=te_ms)
     s_csf, s_gm, s_wm = targets["csf"], targets["gm"], targets["wm"]
 
-    x_knots = np.array([0.0, 0.45 * mu_csf, mu_csf, mu_gm, mu_wm, x_hi], dtype=np.float64)
-    y_knots = np.array(
-        [s_csf * 1.05, s_csf * 1.02, s_csf, s_gm, s_wm, s_wm * 0.78],
-        dtype=np.float64,
-    )
+    if target == "FLAIR":
+        # Unimodal CSF-nulled curve: air/CSF dark -> bright cortical GM -> mid-gray WM
+        x_knots = np.array(
+            [0.0, 0.50 * mu_csf, mu_csf, 0.5 * (mu_csf + mu_gm), mu_gm, mu_wm, x_hi],
+            dtype=np.float64,
+        )
+        y_knots = np.array(
+            [0.0, s_csf * 0.4, s_csf, 0.45 * s_gm, s_gm, s_wm, s_wm * 0.72],
+            dtype=np.float64,
+        )
+    else:
+        # Monotone decreasing T2 / T2* / b=0 curve: bright CSF -> mid GM -> dark WM
+        x_knots = np.array([0.0, 0.45 * mu_csf, mu_csf, mu_gm, mu_wm, x_hi], dtype=np.float64)
+        y_knots = np.array(
+            [s_csf * 1.05, s_csf * 1.02, s_csf, s_gm, s_wm, s_wm * 0.78],
+            dtype=np.float64,
+        )
     pchip = PchipInterpolator(x_knots, y_knots, extrapolate=True)
 
-    # Evaluate continuous inverted contrast inside ICV
+    # Evaluate continuous target contrast inside ICV
     brain_out = np.zeros_like(t1_norm, dtype=np.float32)
     x_eval = np.clip(t1_norm[icv_mask].astype(np.float64), 0.0, x_hi)
     brain_out[icv_mask] = np.maximum(pchip(x_eval), 0.0).astype(np.float32)
 
     if not cfg.preserve_micro_texture:
-        # Optional smoother variant without fine detail
         brain_out = ndimage.gaussian_filter(brain_out, sigma=0.8) * icv_mask
 
-    # Extracranial scalp/fat compartment: retained on FSE T2w, fat-suppressed on EPI BOLD & DWI
-    fat_ret = cfg.fat_retention_t2w if target == "T2w" else cfg.fat_retention_epi
-    scalp_out = np.zeros_like(t1_norm, dtype=np.float32)
-    if np.any(scalp_mask):
-        scalp_rel = np.clip(t1_norm[scalp_mask] / max(mu_gm, 0.1), 0.25, 1.35)
-        scalp_out[scalp_mask] = (fat_ret * s_gm * scalp_rel).astype(np.float32)
+    is_epi = target in ("bold_s0", "dwi_b0")
+    if is_epi and cfg.epi_skull_strip:
+        # Real EPI acquisitions are fat-suppressed & brain-focused: strip skull/scalp/neck cleanly
+        # with a subtle sub-voxel boundary feather to avoid hard stair-step aliasing on downsampling
+        soft_icv = ndimage.gaussian_filter(icv_mask.astype(np.float32), sigma=0.55)
+        soft_icv = np.where(icv_mask, np.maximum(soft_icv, 0.85), soft_icv * 0.25)
+        out = (brain_out * np.clip(soft_icv, 0.0, 1.0)).astype(np.float32)
+        out[~icv_mask] = 0.0
+    else:
+        if target == "T2w":
+            fat_ret = cfg.fat_retention_t2w
+        elif target == "FLAIR":
+            fat_ret = cfg.fat_retention_flair
+        else:
+            fat_ret = cfg.fat_retention_epi
 
-    # Softly feather ICV vs. extracranial boundary to prevent artificial sharp 1-voxel rings
-    head_mask = icv_mask | scalp_mask
-    w_icv = ndimage.gaussian_filter(icv_mask.astype(np.float32), sigma=0.65)
-    w_icv = np.where(head_mask, np.clip(w_icv, 0.0, 1.0), 0.0)
-    # Keep bone/air strictly dark (only brain + scalp carry signal)
-    out = np.where(
-        icv_mask,
-        brain_out,
-        np.where(scalp_mask, (1.0 - w_icv) * scalp_out + w_icv * s_wm * 0.35, 0.0),
-    ).astype(np.float32)
-    out[bone_air_mask] = 0.0
+        scalp_out = np.zeros_like(t1_norm, dtype=np.float32)
+        if np.any(scalp_mask) and fat_ret > 0.0:
+            scalp_rel = np.clip(t1_norm[scalp_mask] / max(mu_gm, 0.1), 0.20, 1.30)
+            scalp_out[scalp_mask] = (fat_ret * s_gm * scalp_rel).astype(np.float32)
 
-    # Normalize intracranial foreground to standard modality scale (~1000 / 950 / 900)
+        head_mask = icv_mask | scalp_mask
+        w_icv = ndimage.gaussian_filter(icv_mask.astype(np.float32), sigma=0.65)
+        w_icv = np.where(head_mask, np.clip(w_icv, 0.0, 1.0), 0.0)
+        out = np.where(
+            icv_mask,
+            brain_out,
+            np.where(scalp_mask, (1.0 - w_icv) * scalp_out + w_icv * s_wm * 0.25, 0.0),
+        ).astype(np.float32)
+        out[bone_air_mask] = 0.0
+
+    # Normalize intracranial foreground to standard modality scale
     scale_map: dict[ContrastTarget, float] = {
         "T2w": 1000.0,
+        "FLAIR": 1000.0,
         "bold_s0": 950.0,
         "dwi_b0": 900.0,
     }
@@ -344,11 +336,12 @@ def invert_t1w_to_t2w(
         tissue_targets_out={"csf": round(s_csf, 4), "gm": round(s_gm, 4), "wm": round(s_wm, 4)},
         used_external_mask=used_ext,
         backend=cfg.backend,
+        mask_method=mask_res.method,
     )
 
 
 class PchipBlochContrastConverter:
-    """Default tissue-aware continuous PCHIP/Bloch T1w -> T2w-like contrast converter."""
+    """Default tissue-aware continuous PCHIP/Bloch T1w -> T2w/FLAIR/EPI contrast converter."""
 
     def convert(
         self,

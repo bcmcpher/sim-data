@@ -15,6 +15,7 @@ htmlcov/
 # Local demo / generated simulation outputs
 demo_bids/
 demo_out/
+tutorial_output/
 *.nii
 *.nii.gz
 !tests/**/*.nii

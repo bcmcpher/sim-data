@@ -53,7 +53,7 @@ def init_phantom(
     console.print(f"[green]Created synthetic BIDS cohort ({n_subjects} subjects) at:[/green] {root}")
 
 
-_VALID_CONTRAST_TARGETS: set[str] = {"T2w", "bold_s0", "dwi_b0"}
+_VALID_CONTRAST_TARGETS: set[str] = {"T2w", "FLAIR", "bold_s0", "dwi_b0"}
 
 
 @app.command("convert-contrast")
@@ -61,7 +61,7 @@ def convert_contrast_cmd(
     t1w: Path = typer.Option(..., "--t1w", exists=True, help="Input clean 3D T1w NIfTI file."),
     out: Path = typer.Option(..., "--out", help="Output NIfTI file path for converted contrast."),
     target: str = typer.Option(
-        "T2w", "--target", help="Target contrast polarity: T2w, bold_s0, or dwi_b0."
+        "T2w", "--target", help="Target contrast polarity: T2w, FLAIR, bold_s0, or dwi_b0."
     ),
     brain_mask: Optional[Path] = typer.Option(
         None, "--brain-mask", exists=True, help="Optional external brain/ICV mask NIfTI (Option 2)."

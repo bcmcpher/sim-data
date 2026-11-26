@@ -103,6 +103,7 @@ def estimate_tissue_pve(
     t2_data: np.ndarray | None = None,
     template_pve_path: str | Path | None = None,
     brain_mask_path: str | Path | None = None,
+    brain_mask_array: np.ndarray | None = None,
     seed: int = 42,
 ) -> TissuePVEMaps:
     """Estimate smooth soft tissue PVE maps (CSF, GM, WM, Scalp) from T1w (+ optional T2w/mask/template)."""
@@ -140,7 +141,12 @@ def estimate_tissue_pve(
     head_mask = priors.brain_mask
 
     ext_icv: np.ndarray | None = None
-    if brain_mask_path is not None:
+    if brain_mask_array is not None and brain_mask_array.shape == shape:
+        cand = np.asarray(brain_mask_array > 0.5, dtype=bool)
+        if int(cand.sum()) >= 64:
+            ext_icv = cand
+            head_mask = head_mask | ext_icv
+    elif brain_mask_path is not None:
         raw_mask = resample_nifti_to_grid(brain_mask_path, shape, target_affine, order=0)
         if raw_mask.ndim == 4:
             raw_mask = raw_mask[..., 0]
