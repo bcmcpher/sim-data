@@ -126,16 +126,36 @@ class DefacingDamage(BaseArtifactTransform):
         ny = (gy - bmin[1]) / bspan[1]
         nz = (gz - bmin[2]) / bspan[2]
 
+        ref_3d = np.mean(ctx.data, axis=3) if ctx.is_4d else ctx.data
+        # Only count non-zero living tissue so pre-defaced datasets (e.g., MR-ART, OpenNeuro)
+        # still experience authentic cortical overshoot into orbitofrontal/temporal cortex.
+        active_fg = ctx.priors.brain_mask & (ref_3d > 0.05 * ctx.priors.fg_median)
+        if int(active_fg.sum()) < 64:
+            active_fg = ctx.priors.brain_mask
+
         if pattern == "anterior_wedge":
             # Oblique plane slicing from anterior-superior down through orbitofrontal cortex
             depth = float(self.params.get("depth", 0.08 + 0.30 * self.severity))
-            # Plane equation: ny - 0.35 * nz > (1 - depth) cuts anterior-inferior aggressively
-            cut_mask = (ny - 0.35 * nz) > (0.96 - depth)
+            # Plane equation: ny - 0.35 * nz > (0.96 - depth) cuts anterior-inferior aggressively
+            plane_score = ny - 0.35 * nz
+            thresh = 0.96 - depth
+            cut_mask = plane_score > thresh
+            # On pre-defaced whole-head scans, ensure the overshoot genuinely reaches active anterior cortex
+            if float((active_fg & cut_mask).sum()) / max(1, int(active_fg.sum())) < 0.015:
+                target_pct = float(np.clip(100.0 - (3.0 + 18.0 * self.severity), 50.0, 99.0))
+                thresh = float(np.percentile(plane_score[active_fg], target_pct))
+                cut_mask = plane_score > thresh
         elif pattern == "orbitofrontal_slab":
             # Rectangular/ellipsoidal facial box extending too far posterior & superior
             y_cut = float(0.92 - (0.08 + 0.28 * self.severity))
             z_cut = float(0.38 + 0.32 * self.severity)
             cut_mask = (ny >= y_cut) & (nz <= z_cut) & (nx >= 0.12) & (nx <= 0.88)
+            if float((active_fg & cut_mask).sum()) / max(1, int(active_fg.sum())) < 0.015:
+                in_slab_xz = active_fg & (nz <= max(z_cut, 0.55)) & (nx >= 0.12) & (nx <= 0.88)
+                if int(in_slab_xz.sum()) >= 32:
+                    target_pct = float(np.clip(100.0 - (5.0 + 28.0 * self.severity), 40.0, 98.0))
+                    y_cut = float(np.percentile(ny[in_slab_xz], target_pct))
+                    cut_mask = (ny >= y_cut) & (nz <= max(z_cut, 0.55)) & (nx >= 0.12) & (nx <= 0.88)
         else:
             # Bilateral/unilateral ear-defacing overshoot clipping lateral temporal cortex
             side = str(ctx.rng.choice(["left", "right", "both"]))
@@ -147,8 +167,8 @@ class DefacingDamage(BaseArtifactTransform):
                 lat_mask |= nx >= (1.0 - inset)
             cut_mask = lat_mask & (ny >= 0.20) & (ny <= 0.80) & (nz >= 0.10) & (nz <= 0.65)
 
-        brain_total = max(1, int(ctx.priors.brain_mask.sum()))
-        damaged_voxels = int((ctx.priors.brain_mask & cut_mask).sum())
+        brain_total = max(1, int(active_fg.sum()))
+        damaged_voxels = int((active_fg & cut_mask).sum())
         damaged_pct = 100.0 * damaged_voxels / brain_total
 
         arr = ctx.data.copy()

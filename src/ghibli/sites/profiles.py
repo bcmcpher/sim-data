@@ -100,9 +100,13 @@ def apply_site_pre_profile(
             arr = np.asarray(out_t, dtype=np.float32) * ref_scale
 
     if abs(offset) > 1e-5:
-        # Apply intensity offset smoothly inside foreground so background air stays free of a flat DC pedestal
+        # Apply intensity offset smoothly inside the full head foreground so background air stays
+        # free of a flat DC pedestal while extracranial scalp does not get an artificial dark ring.
+        offset_support = (
+            ctx.priors.head_mask if ctx.priors.head_mask is not None else ctx.priors.brain_mask
+        )
         fg_soft = ndimage.gaussian_filter(
-            ndimage.binary_dilation(ctx.priors.brain_mask, iterations=2).astype(np.float32),
+            ndimage.binary_dilation(offset_support, iterations=2).astype(np.float32),
             sigma=2.0,
         )
         fg_soft = np.clip(fg_soft, 0.0, 1.0)
@@ -188,17 +192,24 @@ def apply_site_noise_floor(
     g_strength = max(
         0.0, float(site.g_factor_strength * (1.0 + site_rng.normal(0.0, 0.15 * j)))
     )
-    sigma_abs = sigma_rel * ctx.priors.fg_median * site.intensity_gain
+    sigma_target = sigma_rel * ctx.priors.fg_median * site.intensity_gain
+    # Respect excess_variance calibration so site coil noise accounts for native scanner noise sigma_0
+    if ctx.noise_calibration == "excess_variance" and ctx.baseline_noise_sigma > 0.0:
+        native_scaled = ctx.baseline_noise_sigma * site.intensity_gain
+        sigma_abs = float(np.sqrt(max(sigma_target**2 - native_scaled**2, 0.0)))
+    else:
+        sigma_abs = float(sigma_target)
     noise_seed = int(site_rng.integers(0, 2**31 - 1))
 
-    ctx.data = apply_noncentral_chi_noise(
-        ctx.data,
-        sigma=sigma_abs,
-        coil_count=site.coil_count,
-        g_factor_strength=g_strength,
-        seed=noise_seed,
-        device=ctx.torch_device,
-    )
+    if sigma_abs > 1e-6:
+        ctx.data = apply_noncentral_chi_noise(
+            ctx.data,
+            sigma=sigma_abs,
+            coil_count=site.coil_count,
+            g_factor_strength=g_strength,
+            seed=noise_seed,
+            device=ctx.torch_device,
+        )
     return {
         "site_noise_sigma_rel": round(sigma_rel, 5),
         "site_noise_sigma_abs": round(sigma_abs, 5),

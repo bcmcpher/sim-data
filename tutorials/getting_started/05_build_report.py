@@ -239,8 +239,9 @@ def _build_html_report(
         )
         parts.append(
             f"<ul><li>Resolved RAS+ axes: <code>{html.escape(str(s1.get('encoding_axes_ras')))}</code> "
-            f"(explicit PE={s1.get('sidecar_has_pe_dir')}, SL={s1.get('sidecar_has_sl_dir')})</li>"
-            f"<li>Foreground mask: <code>{p.get('fg_fraction')}</code> of FOV, bbox fraction "
+            f"(source=<code>{html.escape(str(s1.get('encoding_axes_source', 'unknown')))}</code>)</li>"
+            f"<li>ICV brain mask (<code>{html.escape(str(s1.get('brain_mask_method', 'auto')))}</code>): "
+            f"<code>{p.get('fg_fraction')}</code> of FOV, bbox fraction "
             f"<code>{p.get('bbox_frac')}</code>, median=<code>{p.get('fg_median')}</code>, "
             f"p95=<code>{p.get('fg_p95')}</code>, native noise &sigma;<sub>0</sub>=<code>{p.get('native_noise_sigma0')}</code></li></ul>"
         )
@@ -343,7 +344,6 @@ def _build_html_report(
         for label, key in [
             ("T1w Artifact Contact Sheet (Part 1/2)", "t1w_artifacts_part1"),
             ("T1w Artifact Contact Sheet (Part 2/2)", "t1w_artifacts_part2"),
-            ("Animated T1w motion_3d Flipbook (Baseline -> Low -> Mid -> High)", "t1w_motion3d_gif"),
             ("4D / EPI / DWI Artifact Contact Sheet", "artifacts_4d_grid"),
             ("Animated 4D BOLD motion_4d Movie (Synced Across TRs)", "bold_motion4d_gif"),
             ("Animated 4D DWI dwi_slice_dropout Sweep (High-b Volumes)", "dwi_dropout_gif"),
@@ -470,11 +470,12 @@ def run_step(
         p = s1.get("priors", {})
         lines.append(
             f"- Resolved RAS+ axes: `{s1.get('encoding_axes_ras')}` "
-            f"(explicit PE={s1.get('sidecar_has_pe_dir')}, SL={s1.get('sidecar_has_sl_dir')})"
+            f"(source=`{s1.get('encoding_axes_source', 'unknown')}`)"
         )
         lines.append(
-            f"- Foreground mask: `{p.get('fg_fraction')}` of FOV, bbox fraction `{p.get('bbox_frac')}`, "
-            f"median=`{p.get('fg_median')}`, p95=`{p.get('fg_p95')}`, native noise $\\sigma_0$=`{p.get('native_noise_sigma0')}`"
+            f"- ICV brain mask (`{s1.get('brain_mask_method', 'auto')}`): `{p.get('fg_fraction')}` of FOV, "
+            f"bbox fraction `{p.get('bbox_frac')}`, median=`{p.get('fg_median')}`, p95=`{p.get('fg_p95')}`, "
+            f"native noise $\\sigma_0$=`{p.get('native_noise_sigma0')}`"
         )
         fig1 = s1.get("figures", {}).get("input_priors")
         if fig1:
@@ -536,7 +537,6 @@ def run_step(
         for label, key in [
             ("T1w Artifact Contact Sheet (Part 1/2)", "t1w_artifacts_part1"),
             ("T1w Artifact Contact Sheet (Part 2/2)", "t1w_artifacts_part2"),
-            ("Animated T1w motion_3d Flipbook", "t1w_motion3d_gif"),
             ("4D / EPI / DWI Artifact Contact Sheet", "artifacts_4d_grid"),
             ("Animated 4D BOLD motion_4d Movie", "bold_motion4d_gif"),
             ("Animated 4D DWI dwi_slice_dropout Sweep", "dwi_dropout_gif"),

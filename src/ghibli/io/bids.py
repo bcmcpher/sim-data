@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import fnmatch
 import json
 import re
 from dataclasses import dataclass, field
@@ -83,8 +84,16 @@ def _parse_modality(path: Path) -> Modality | None:
 def discover_bids_scans(
     bids_dir: str | Path,
     modalities: list[Modality] | None = None,
+    acq: str | None = None,
+    filename_glob: str | None = None,
 ) -> list[BIDSScan]:
-    """Recursively discover BIDS MRI scans under a BIDS root directory."""
+    """Recursively discover BIDS MRI scans under a BIDS root directory.
+
+    Optional filters:
+    - `acq`: exact or fnmatch glob pattern on the BIDS `acq-<label>` entity (e.g. `"standard"`
+      to select clean `acq-standard` scans in multi-acquisition datasets like MR-ART).
+    - `filename_glob`: fnmatch glob pattern against the NIfTI filename (e.g. `"*acq-standard*"`).
+    """
     root = Path(bids_dir)
     if not root.exists():
         raise FileNotFoundError(f"BIDS directory not found: {root}")
@@ -99,11 +108,19 @@ def discover_bids_scans(
         if "derivatives" in rel_parts:
             continue
 
+        if filename_glob and not fnmatch.fnmatch(path.name, filename_glob):
+            continue
+
         modality = _parse_modality(path)
         if modality is None or modality not in allowed:
             continue
 
         entities = dict(_ENTITY_RE.findall(path.name))
+        if acq is not None:
+            scan_acq = entities.get("acq", "")
+            if not scan_acq or not fnmatch.fnmatch(scan_acq, acq):
+                continue
+
         subject = entities.get("sub", "unknown")
         session = entities.get("ses")
         datatype = _MODALITY_FOLDERS[modality]

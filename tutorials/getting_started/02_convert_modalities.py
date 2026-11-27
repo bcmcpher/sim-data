@@ -230,6 +230,12 @@ def run_step(
             }
 
         assert first_res is not None
+        # Preserve the original extraction method name when reusing Step 01's cached mask
+        eff_mask_method = (
+            str(seed_diag.get("brain_mask_method", first_res.mask_method))
+            if (brain_mask is None and first_res.mask_method == "external")
+            else first_res.mask_method
+        )
         # Persist the extracted ICV mask for downstream visual slicing and inspection
         icv_mask_path = contrast_dir / "extracted_icv_mask.nii.gz"
         nib.save(nib.Nifti1Image(first_res.icv_mask.astype(np.uint8), t1_affine), str(icv_mask_path))
@@ -241,19 +247,19 @@ def run_step(
             bone_air_mask=first_res.bone_air_mask,
             converted=converted_arrays,
             out_path=out_root / "figures" / "02a_contrast_compartments.png",
-            mask_method=first_res.mask_method,
+            mask_method=eff_mask_method,
         )
 
         scalp_ratio = float(first_res.scalp_mask.sum()) / max(1.0, float(first_res.icv_mask.sum()))
-        good_mask = first_res.used_external_mask or first_res.mask_method == "evac" or scalp_ratio >= 0.12
+        good_mask = first_res.used_external_mask or eff_mask_method == "evac" or scalp_ratio >= 0.12
         checks.append(
             common.CheckResult(
                 step="02_convert_modalities",
                 name="icv_vs_scalp_separation",
                 status="pass" if good_mask else "warn",
-                metric=f"method={first_res.mask_method}, ICV={first_res.icv_mask.mean():.3f}, scalp={first_res.scalp_mask.mean():.3f} (scalp/ICV={scalp_ratio:.3f})",
+                metric=f"method={eff_mask_method}, ICV={first_res.icv_mask.mean():.3f}, scalp={first_res.scalp_mask.mean():.3f} (scalp/ICV={scalp_ratio:.3f})",
                 detail=(
-                    f"Intracranial brain mask ({first_res.mask_method}) separated brain parenchyma cleanly from cortical skull bone and extracranial scalp/neck."
+                    f"Intracranial brain mask ({eff_mask_method}) separated brain parenchyma cleanly from cortical skull bone and extracranial scalp/neck."
                     if good_mask
                     else "Morphological fallback classified only a thin rim as scalp; supply --brain-mask or enable EVAC+ brain extraction."
                 ),
@@ -441,7 +447,7 @@ def run_step(
         "multimodal_bids_dir": str(multimodal_dir),
         "synthesis_manifest": str(synth_res.manifest_path),
         "extracted_icv_mask": str(icv_mask_path),
-        "brain_mask_method": first_res.mask_method,
+        "brain_mask_method": eff_mask_method,
         "baseline_iqms_tsv": str(iqm_tsv),
         "contrast_conversion": contrast_meta,
         "modality_shapes": mod_shapes,

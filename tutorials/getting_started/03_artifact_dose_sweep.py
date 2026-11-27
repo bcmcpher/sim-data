@@ -84,6 +84,19 @@ def _audit_zero_leakage(bids_dir: Path, artifact_names: list[str]) -> tuple[bool
     return (len(leaks) == 0), leaks
 
 
+def _extract_artifact_params(row: pd.Series, art_name: str) -> dict[str, Any]:
+    """Extract realized parameter dict for `art_name` from a manifest row's artifacts_json."""
+    try:
+        items = json.loads(str(row.get("artifacts_json", "[]")))
+    except Exception:
+        return {}
+    for item in items:
+        if isinstance(item, dict) and item.get("name") == art_name:
+            params = item.get("params", {})
+            return params if isinstance(params, dict) else {}
+    return {}
+
+
 def _short_param_note(art_name: str, artifacts_json_str: str) -> str:
     """Extract a concise realized parameter label from manifest artifacts_json."""
     try:
@@ -425,9 +438,21 @@ def _render_4d_artifacts_figure(
     return common.save_figure(fig, out_path)
 
 
-def _to_rgb_tile(sl_2d: np.ndarray, vmin: float, vmax: float, target_h: int = 220) -> Image.Image:
+def _to_rgb_tile(
+    sl_2d: np.ndarray,
+    vmin: float,
+    vmax: float,
+    target_h: int = 220,
+    ref_contour: np.ndarray | None = None,
+) -> Image.Image:
     u8 = (common.normalize_slice(sl_2d, vmin, vmax) * 255.0).astype(np.uint8)
-    pil = Image.fromarray(u8, mode="L").convert("RGB")
+    rgb = np.stack([u8, u8, u8], axis=-1)
+    if ref_contour is not None and ref_contour.shape == u8.shape:
+        # Subtle cyan reference outline from TR 0 so cumulative head drift & shifts are easy to track
+        rgb[ref_contour, 0] = (rgb[ref_contour, 0].astype(np.float32) * 0.45).astype(np.uint8)
+        rgb[ref_contour, 1] = np.minimum(255, rgb[ref_contour, 1].astype(np.int32) + 120).astype(np.uint8)
+        rgb[ref_contour, 2] = np.minimum(255, rgb[ref_contour, 2].astype(np.int32) + 140).astype(np.uint8)
+    pil = Image.fromarray(rgb, mode="RGB")
     w, h = pil.size
     if h > 0 and h != target_h:
         new_w = max(1, int(round(w * (target_h / h))))
@@ -451,47 +476,102 @@ def _compose_labeled_strip(tiles: list[tuple[str, Image.Image]], banner: str) ->
     return canvas
 
 
-def _render_t1w_motion3d_gif(
-    t1w_df: pd.DataFrame,
-    t1w_out: Path,
-    base_vol: np.ndarray,
-    out_path: Path,
-    icv_mid: tuple[int, int, int] | None = None,
-) -> Path | None:
-    """Create an animated Baseline -> Low -> Mid -> High flipbook GIF for 3D intra-scan motion."""
-    sub = t1w_df[t1w_df["target_artifact"] == "motion_3d"].sort_values("dose_level")
-    if sub.empty:
-        return None
-    mid_z = icv_mid[2] if icv_mid is not None else common.midline_indices(base_vol)[2]
-    vmin, vmax = common.compute_window(base_vol)
-    base_tile = _to_rgb_tile(common.orient_2d(base_vol[:, :, mid_z]), vmin, vmax, target_h=280)
-
-    frames: list[Image.Image] = [
-        _compose_labeled_strip(
-            [("Reference (Baseline 0.0)", base_tile), ("Current: Baseline (0.00)", base_tile)],
-            "T1w motion_3d Flipbook (Baseline -> Low -> Mid -> High)",
-        )
-    ]
-    for _, row in sub.iterrows():
-        vol, _, _ = common.load_ras_volume(t1w_out / str(row["nifti_path"]))
-        cur_tile = _to_rgb_tile(common.orient_2d(vol[:, :, mid_z]), vmin, vmax, target_h=280)
-        dose = float(row["dose_level"])
-        ssim_v = float(row.get("ref_ssim", 0.0))
-        frames.append(
-            _compose_labeled_strip(
-                [("Reference (Baseline 0.0)", base_tile), (f"motion_3d s={dose:.2f} (SSIM={ssim_v:.3f})", cur_tile)],
-                "T1w motion_3d Flipbook (Baseline -> Low -> Mid -> High)",
-            )
-        )
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    frames[0].save(
-        str(out_path),
-        save_all=True,
-        append_images=frames[1:],
-        duration=900,
-        loop=0,
+def _render_motion_param_strip(
+    tr_idx: int,
+    n_trs: int,
+    width_px: int,
+    height_px: int,
+    high_params: dict[str, list[float]] | None,
+    fd_by_label: list[tuple[str, np.ndarray]],
+) -> Image.Image:
+    """Render a synchronized dark-theme motion parameter strip (Tx/Ty/Tz, Rx/Ry/Rz, FD) with TR playhead."""
+    dpi = 100
+    fig, axes = plt.subplots(
+        1, 3, figsize=(width_px / dpi, height_px / dpi), dpi=dpi, facecolor="#12161c"
     )
-    return out_path
+    trs = np.arange(1, n_trs + 1)
+    cur_tr = tr_idx + 1
+
+    def _style_ax(ax: Any, title: str, ylabel: str) -> None:
+        ax.set_facecolor("#181e27")
+        ax.set_title(title, color="#e6edf3", fontsize=8.0, fontweight="bold", pad=4)
+        ax.set_xlabel("TR", color="#9fb0c4", fontsize=7.0, labelpad=2)
+        ax.set_ylabel(ylabel, color="#9fb0c4", fontsize=7.0, labelpad=2)
+        ax.tick_params(colors="#9fb0c4", labelsize=6.5, length=2.5)
+        ax.set_xlim(1, max(2, n_trs))
+        ax.grid(True, color="#2b3442", linewidth=0.5, alpha=0.8)
+        for spine in ax.spines.values():
+            spine.set_color("#303a48")
+            spine.set_linewidth(0.7)
+        ax.axvline(cur_tr, color="#ffffff", linestyle="--", linewidth=1.0, alpha=0.85, zorder=4)
+
+    # Panel 1: 6-DOF Translations (mm) at High dose
+    ax_t = axes[0]
+    _style_ax(ax_t, "Translations (High 0.85)", "mm")
+    if high_params is not None:
+        t_specs = [
+            ("tx", high_params.get("trans_x_mm", []), "#ff6b6b"),
+            ("ty", high_params.get("trans_y_mm", []), "#51cf66"),
+            ("tz", high_params.get("trans_z_mm", []), "#339af0"),
+        ]
+        all_t: list[float] = []
+        for name, vals, clr in t_specs:
+            if len(vals) >= n_trs:
+                y = np.asarray(vals[:n_trs], dtype=np.float64)
+                all_t.extend(y.tolist())
+                ax_t.plot(trs, y, color=clr, lw=1.35, label=name)
+                ax_t.scatter([cur_tr], [y[tr_idx]], color=clr, edgecolor="#ffffff", s=26, linewidth=0.8, zorder=5)
+        ax_t.axhline(0.0, color="#526075", lw=0.6, ls=":")
+        if all_t:
+            lim = max(0.5, max(abs(min(all_t)), abs(max(all_t))) * 1.18)
+            ax_t.set_ylim(-lim, lim)
+        ax_t.legend(loc="upper right", fontsize=6.0, frameon=False, labelcolor="#e6edf3", ncol=3, handlelength=1.1, columnspacing=0.7)
+
+    # Panel 2: 6-DOF Rotations (deg) at High dose
+    ax_r = axes[1]
+    _style_ax(ax_r, "Rotations (High 0.85)", "deg")
+    if high_params is not None:
+        r_specs = [
+            ("rx", high_params.get("rot_x_deg", []), "#ffa94d"),
+            ("ry", high_params.get("rot_y_deg", []), "#da77f2"),
+            ("rz", high_params.get("rot_z_deg", []), "#ffd43b"),
+        ]
+        all_r: list[float] = []
+        for name, vals, clr in r_specs:
+            if len(vals) >= n_trs:
+                y = np.asarray(vals[:n_trs], dtype=np.float64)
+                all_r.extend(y.tolist())
+                ax_r.plot(trs, y, color=clr, lw=1.35, label=name)
+                ax_r.scatter([cur_tr], [y[tr_idx]], color=clr, edgecolor="#ffffff", s=26, linewidth=0.8, zorder=5)
+        ax_r.axhline(0.0, color="#526075", lw=0.6, ls=":")
+        if all_r:
+            lim = max(0.5, max(abs(min(all_r)), abs(max(all_r))) * 1.18)
+            ax_r.set_ylim(-lim, lim)
+        ax_r.legend(loc="upper right", fontsize=6.0, frameon=False, labelcolor="#e6edf3", ncol=3, handlelength=1.1, columnspacing=0.7)
+
+    # Panel 3: Framewise Displacement (mm) across all doses
+    ax_fd = axes[2]
+    _style_ax(ax_fd, "Framewise Displacement (FD)", "mm")
+    fd_colors = ["#8b949e", "#4dabf7", "#ffd43b", "#ff6b6b"]
+    max_fd = 0.5
+    for idx, (lbl, fd_arr) in enumerate(fd_by_label):
+        y = np.asarray(fd_arr[:n_trs], dtype=np.float64)
+        max_fd = max(max_fd, float(np.max(y)) if y.size else 0.5)
+        clr = fd_colors[idx % len(fd_colors)]
+        short_lbl = lbl.replace("Baseline (0.0)", "0.0").replace("Dose ", "")
+        ax_fd.plot(trs, y, color=clr, lw=1.35, label=short_lbl)
+        ax_fd.scatter([cur_tr], [y[tr_idx]], color=clr, edgecolor="#ffffff", s=26, linewidth=0.8, zorder=5)
+    ax_fd.set_ylim(0.0, max_fd * 1.15)
+    ax_fd.legend(loc="upper right", fontsize=6.0, frameon=False, labelcolor="#e6edf3", ncol=2, handlelength=1.1, columnspacing=0.7)
+
+    fig.subplots_adjust(left=0.065, right=0.985, top=0.84, bottom=0.22, wspace=0.28)
+    fig.canvas.draw()
+    rgba = np.asarray(fig.canvas.buffer_rgba())
+    pil_plot = Image.fromarray(rgba[..., :3], mode="RGB")
+    plt.close(fig)
+    if pil_plot.size != (width_px, height_px):
+        pil_plot = pil_plot.resize((width_px, height_px), resample=Image.Resampling.BILINEAR)
+    return pil_plot
 
 
 def _render_4d_motion_and_dropout_gifs(
@@ -499,34 +579,80 @@ def _render_4d_motion_and_dropout_gifs(
     bids_dir_4d: Path,
     out_root: Path,
 ) -> dict[str, str]:
-    """Generate animated GIFs for 4D BOLD motion_4d (all TRs) and DWI slice dropout (all high-b vols)."""
+    """Generate animated GIFs for 4D BOLD motion_4d (all TRs + 6-DOF line plot) and DWI slice dropout."""
+    from scipy import ndimage
+
     gifs: dict[str, str] = {}
     pos_doses = [d for d in common.DEFAULT_DOSE_LEVELS if d > 0.0]
 
-    # 1. BOLD motion_4d animated 4-way synced movie (Baseline | Low | Mid | High)
+    # 1. BOLD motion_4d animated 4-way synced movie (Baseline | Low | Mid | High) + motion curves
     b_base_rows = manifest_4d[(manifest_4d["modality"] == "bold") & (manifest_4d["target_artifact"] == "baseline")]
     b_mot_rows = manifest_4d[(manifest_4d["modality"] == "bold") & (manifest_4d["target_artifact"] == "motion_4d")].sort_values("dose_level")
     if not b_base_rows.empty and not b_mot_rows.empty:
-        base_4d, _, _ = common.load_ras_volume(bids_dir_4d / str(b_base_rows.iloc[0]["nifti_path"]))
-        vols: list[tuple[str, np.ndarray]] = [("Baseline (0.0)", base_4d)]
+        base_4d, _, zooms = common.load_ras_volume(bids_dir_4d / str(b_base_rows.iloc[0]["nifti_path"]))
+        base_priors = compute_anatomical_priors(np.mean(base_4d, axis=3))
+        mid_z = (base_priors.bbox_min[2] + base_priors.bbox_max[2]) // 2
+        vmin, vmax = common.compute_window(np.mean(base_4d, axis=3))
+
+        # 1-pixel reference contour of Baseline TR 0 brain outline to make cumulative drift obvious
+        ref_mask_2d = common.orient_2d(base_priors.brain_mask[:, :, mid_z].astype(np.float32)) > 0.5
+        ref_contour = ref_mask_2d ^ ndimage.binary_erosion(ref_mask_2d, iterations=1)
+
+        vols: list[tuple[str, np.ndarray, np.ndarray]] = [
+            ("Baseline (0.0)", base_4d, np.zeros(base_4d.shape[3], dtype=np.float32))
+        ]
         by_dose = {round(float(r["dose_level"]), 2): r for _, r in b_mot_rows.iterrows()}
+        high_motion_params: dict[str, list[float]] | None = None
         for d in pos_doses:
             if round(d, 2) in by_dose:
-                v_arr, _, _ = common.load_ras_volume(bids_dir_4d / str(by_dose[round(d, 2)]["nifti_path"]))
-                vols.append((f"Dose {d:.2f}", v_arr))
-        mid_z = common.midline_indices(np.mean(base_4d, axis=3))[2]
-        vmin, vmax = common.compute_window(np.mean(base_4d, axis=3))
-        n_trs = min(v.shape[3] for _, v in vols)
+                row_d = by_dose[round(d, 2)]
+                v_arr, _, _ = common.load_ras_volume(bids_dir_4d / str(row_d["nifti_path"]))
+                # Prefer ground-truth 6-DOF motion_params recorded in manifest.tsv; fall back to blind FD proxy
+                mp = _extract_artifact_params(row_d, "motion_4d").get("motion_params")
+                if isinstance(mp, dict) and "fd_mm" in mp:
+                    v_fd = np.asarray(mp["fd_mm"], dtype=np.float32)
+                    high_motion_params = mp  # last dose (High 0.85) wins
+                else:
+                    v_fd = estimate_fd_proxy(v_arr, base_priors.brain_mask, zooms)
+                vols.append((f"Dose {d:.2f}", v_arr, v_fd))
+
+        n_trs = min(v.shape[3] for _, v, _ in vols)
+        fd_by_label = [(lbl, fd_arr) for lbl, _, fd_arr in vols]
         frames: list[Image.Image] = []
         for t in range(n_trs):
             tiles = [
-                (lbl, _to_rgb_tile(common.orient_2d(v[:, :, mid_z, t]), vmin, vmax, target_h=200))
-                for lbl, v in vols
+                (
+                    f"{lbl} | FD={float(fd_arr[t]):.2f}mm",
+                    _to_rgb_tile(
+                        common.orient_2d(v[:, :, mid_z, t]),
+                        vmin,
+                        vmax,
+                        target_h=200,
+                        ref_contour=ref_contour,
+                    ),
+                )
+                for lbl, v, fd_arr in vols
             ]
-            frames.append(_compose_labeled_strip(tiles, f"BOLD motion_4d — TR {t + 1:02d}/{n_trs:02d} (Axial)"))
+            top_strip = _compose_labeled_strip(
+                tiles,
+                f"BOLD motion_4d - TR {t + 1:02d}/{n_trs:02d} (Axial; cyan = TR 0 reference contour)",
+            )
+            plot_h = 175
+            plot_strip = _render_motion_param_strip(
+                tr_idx=t,
+                n_trs=n_trs,
+                width_px=top_strip.size[0],
+                height_px=plot_h,
+                high_params=high_motion_params,
+                fd_by_label=fd_by_label,
+            )
+            combined = Image.new("RGB", (top_strip.size[0], top_strip.size[1] + plot_h), color=(18, 22, 28))
+            combined.paste(top_strip, (0, 0))
+            combined.paste(plot_strip, (0, top_strip.size[1]))
+            frames.append(combined)
         gif_bold = out_root / "figures" / "03c_bold_motion4d.gif"
         gif_bold.parent.mkdir(parents=True, exist_ok=True)
-        frames[0].save(str(gif_bold), save_all=True, append_images=frames[1:], duration=160, loop=0)
+        frames[0].save(str(gif_bold), save_all=True, append_images=frames[1:], duration=180, loop=0)
         gifs["bold_motion4d_gif"] = str(gif_bold.relative_to(out_root))
 
     # 2. DWI slice dropout animated coronal sweep (Baseline | Mid | High)
@@ -554,7 +680,7 @@ def _render_4d_motion_and_dropout_gifs(
                 for lbl, v in vols_d
             ]
             frames_d.append(
-                _compose_labeled_strip(tiles, f"DWI dwi_slice_dropout — Vol {int(idx_v) + 1:02d}/{base_4d.shape[3]:02d} ({b_lbl}, Coronal)")
+                _compose_labeled_strip(tiles, f"DWI dwi_slice_dropout - Vol {int(idx_v) + 1:02d}/{base_4d.shape[3]:02d} ({b_lbl}, Coronal)")
             )
         gif_dwi = out_root / "figures" / "03d_dwi_slice_dropout.gif"
         gif_dwi.parent.mkdir(parents=True, exist_ok=True)
@@ -721,7 +847,7 @@ def run_step(
                     int((c_icv[:, 2].min() + c_icv[:, 2].max()) // 2),
                 )
 
-        # Render 2-part T1w contact sheets + motion_3d flipbook GIF + sensitivity plots
+        # Render 2-part T1w contact sheets + sensitivity plots
         half = (len(t1w_arts) + 1) // 2
         fig1 = _render_t1w_artifact_sheet(
             t1w_arts[:half],
@@ -743,15 +869,6 @@ def run_step(
         )
         figures["t1w_artifacts_part1"] = str(fig1.relative_to(out_root))
         figures["t1w_artifacts_part2"] = str(fig2.relative_to(out_root))
-        gif_m3 = _render_t1w_motion3d_gif(
-            t1w_df,
-            t1w_out,
-            out_base_arr,
-            out_root / "figures" / "03e_t1w_motion3d_flipbook.gif",
-            icv_mid=icv_mid,
-        )
-        if gif_m3 is not None:
-            figures["t1w_motion3d_gif"] = str(gif_m3.relative_to(out_root))
         if t1w_sens.heatmap_path:
             figures["t1w_sensitivity_heatmap"] = str(t1w_sens.heatmap_path.relative_to(out_root))
         if t1w_sens.curves_path:

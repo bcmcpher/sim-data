@@ -9,6 +9,8 @@ from __future__ import annotations
 import numpy as np
 from dipy.core.gradients import gradient_table
 from dipy.denoise.noise_estimate import estimate_sigma, piesno
+from scipy import ndimage
+from skimage.registration import phase_cross_correlation
 
 from ghibli.io.orientation import compute_anatomical_priors
 from ghibli.iqm.structural import compute_efc, compute_fwhm, compute_gsr
@@ -25,56 +27,69 @@ def estimate_dwi_fd_proxy(
     """Shell-aware blind framewise motion proxy (mm) for multi-shell 4D DWI.
 
     Prevents cross-shell contrast jumps (b=0 -> b=1000 -> b=2000) and anisotropic WM
-    attenuation from masquerading as head motion by:
-    1. Computing per-volume clamped/normalized foreground envelopes (soft binary masks)
-       within a dilated brain support so rigid shifts/rotations move the envelope while
-       internal diffusion-weighting changes cancel out.
-    2. Comparing consecutive volumes within the same b-shell (bins of width 250 s/mm^2).
+    fiber-direction attenuation from masquerading as head motion by:
+    1. Converting each volume into a direction-invariant outer brain silhouette (clamped
+       smoothly between background air p99 and low foreground p15 so GM and both parallel
+       and perpendicular WM saturate cleanly to 1.0 regardless of gradient orientation).
+    2. Registering consecutive volumes within the same b-shell (250 s/mm^2 bins) via
+       3D sub-voxel phase cross-correlation across left/right hemispheres (capturing both
+       rigid translation and rotation while reporting ~0.0 mm on stationary multi-shell DWI).
     """
     n_vols = data_4d.shape[3]
     fd = np.zeros(n_vols, dtype=np.float32)
-    if n_vols < 2:
+    if n_vols < 2 or int(brain_mask.sum()) < 32:
         return fd
 
-    coords = np.argwhere(brain_mask).astype(np.float64)
-    if coords.shape[0] < 32:
-        return fd
+    bg = ~ndimage.binary_dilation(brain_mask, iterations=5)
+    raw_all = np.maximum(data_4d, 0.0).astype(np.float32)
+    sils = np.zeros_like(raw_all, dtype=np.float32)
 
-    zoom_arr = np.array(zooms, dtype=np.float64)[:, None]
-    centroid = np.mean(coords, axis=0)
-    raw = np.maximum(data_4d[brain_mask], 0.0).astype(np.float64)  # (V, T)
+    for v in range(n_vols):
+        vol = raw_all[..., v]
+        bg_v = vol[bg] if int(bg.sum()) >= 32 else np.array([0.0], dtype=np.float32)
+        bg_hi = float(np.percentile(bg_v, 99.0))
+        fg_lo = max(bg_hi * 1.5 + 1e-4, float(np.percentile(vol[brain_mask], 15.0)))
+        sils[..., v] = np.clip((vol - bg_hi) / max(fg_lo - bg_hi, _EPS), 0.0, 1.0)
 
-    # Normalize each volume to a soft saturated foreground envelope in [0, 1]
-    p50 = np.percentile(raw, 50.0, axis=0, keepdims=True) + _EPS
-    norm_w = np.clip(raw / (0.65 * p50), 0.0, 1.0)
-
-    # Group volumes by rounded b-shell (0, 1000, 2000, ...) so transitions across shells are excluded
     if bvals is not None and len(bvals) == n_vols:
         shells = np.where(bvals <= 50.0, 0, np.rint(bvals / 250.0).astype(int) * 250)
     else:
         shells = np.zeros(n_vols, dtype=int)
 
-    half_coms: list[np.ndarray] = []
-    for axis in range(3):
-        for side_mask in (coords[:, axis] >= centroid[axis], coords[:, axis] < centroid[axis]):
-            if int(np.sum(side_mask)) < 16:
-                continue
-            c_sub = coords[side_mask]
-            w_sub = norm_w[side_mask]
-            w_sum = np.sum(w_sub, axis=0) + _EPS
-            com_mm = ((c_sub.T @ w_sub) / w_sum[None, :]) * zoom_arr  # (3, T)
-            half_coms.append(com_mm)
-
-    if not half_coms:
-        return fd
+    zoom_arr = np.array(zooms, dtype=np.float64)
+    coords = np.argwhere(brain_mask)
+    cx = int(round(float(np.mean(coords[:, 0]))))
+    use_hemis = cx >= 8 and (sils.shape[0] - cx) >= 8
 
     last_idx_by_shell: dict[int, int] = {}
     for v in range(n_vols):
         sh = int(shells[v])
         if sh in last_idx_by_shell:
             prev_v = last_idx_by_shell[sh]
-            disps = [float(np.sum(np.abs(com[:, v] - com[:, prev_v]))) for com in half_coms]
-            fd[v] = float(np.mean(disps))
+            if use_hemis:
+                shift_l, _, _ = phase_cross_correlation(
+                    sils[:cx, :, :, prev_v],
+                    sils[:cx, :, :, v],
+                    upsample_factor=10,
+                    normalization=None,
+                )
+                shift_r, _, _ = phase_cross_correlation(
+                    sils[cx:, :, :, prev_v],
+                    sils[cx:, :, :, v],
+                    upsample_factor=10,
+                    normalization=None,
+                )
+                disp_l = float(np.sum(np.abs(shift_l) * zoom_arr))
+                disp_r = float(np.sum(np.abs(shift_r) * zoom_arr))
+                fd[v] = float(0.5 * (disp_l + disp_r))
+            else:
+                shift, _, _ = phase_cross_correlation(
+                    sils[..., prev_v],
+                    sils[..., v],
+                    upsample_factor=10,
+                    normalization=None,
+                )
+                fd[v] = float(np.sum(np.abs(shift) * zoom_arr))
         last_idx_by_shell[sh] = v
 
     return fd

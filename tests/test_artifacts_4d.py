@@ -136,7 +136,7 @@ def test_dwi_shell_aware_fd_is_low_when_stationary_and_rises_with_motion_4d(
     iqm_clean = extract_diffusion_iqms(
         ctx_clean.data, ctx_clean.zooms, bvals=ctx_clean.bvals, bvecs=ctx_clean.bvecs
     )
-    assert iqm_clean["mean_fd"] < 0.35
+    assert iqm_clean["mean_fd"] < 0.15
 
     ctx_mot = _make_4d_context(bids_phantom_dir, "dwi", seed=70)
     create_artifact("motion_4d", severity=0.80).apply(ctx_mot)
@@ -144,3 +144,24 @@ def test_dwi_shell_aware_fd_is_low_when_stationary_and_rises_with_motion_4d(
         ctx_mot.data, ctx_mot.zooms, bvals=ctx_mot.bvals, bvecs=ctx_mot.bvecs
     )
     assert iqm_mot["mean_fd"] > iqm_clean["mean_fd"] + 0.25
+
+
+def test_bold_motion_4d_trajectory_is_temporally_continuous(bids_phantom_dir: Path) -> None:
+    """Motion4D must follow a smooth cumulative head-pose trajectory rather than IID per-frame jumps."""
+    ctx = _make_4d_context(bids_phantom_dir, "bold", seed=88)
+    # Expand to 24 TRs so temporal continuity & FD statistics are meaningful
+    ctx.data = np.repeat(ctx.data, 2, axis=3)
+    rec = create_artifact("motion_4d", severity=0.55).apply(ctx)
+    assert rec.params["fd_mean_mm"] > 0.15
+    assert rec.params["fd_mean_mm"] < 2.0
+    # Frame-to-frame center-of-mass trajectory should be strongly positively autocorrelated (lag-1)
+    mask = ctx.priors.brain_mask
+    coords = np.argwhere(mask).astype(np.float64)
+    vals = np.maximum(ctx.data[mask], 0.0).astype(np.float64)
+    com = (coords.T @ vals) / (np.sum(vals, axis=0, keepdims=True) + 1e-6)  # (3, T)
+    # Check lag-1 correlation along the axis with largest motion variance
+    axis_vars = np.var(com, axis=1)
+    best_ax = int(np.argmax(axis_vars))
+    series = com[best_ax]
+    corr = float(np.corrcoef(series[:-1], series[1:])[0, 1])
+    assert corr > 0.55

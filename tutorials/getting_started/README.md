@@ -50,13 +50,13 @@ Each script can also be executed independently on the same `--out-dir` to inspec
 ```text
 <out-dir>/
 ├── 00_seed_bids/                 # Clean staged 1-subject BIDS input
-├── 01_contrast_standalone/       # Standalone convert-contrast outputs (T2w, bold_s0, dwi_b0)
+├── 01_contrast_standalone/       # Standalone convert-contrast outputs (T2w, FLAIR, bold_s0, dwi_b0)
 ├── 01_multimodal_bids/           # Completed 5-modality BIDS (real T1w + synthesized T2w/FLAIR/bold/dwi)
 ├── 02_artifacts_t1w/             # 34 blinded T1w dose-response scans + manifest + sensitivity report
-├── 02_artifacts_4d/              # 23 blinded BOLD/DWI dose-response scans + manifests + sensitivity reports
+├── 02_artifacts_4d/              # 29 blinded BOLD/DWI dose-response scans + manifests + sensitivity reports
 ├── 03_sites_clean/               # 5 clean same-subject scans (Native + 4 curated sites) + IQM shifts
 ├── 03_sites_factorial/           # 24 multi-site scans + ComBat/CovBat audit + deterministic QC benchmark
-├── figures/                      # Annotated PNG visual inspection sheets
+├── figures/                      # Annotated PNG visual inspection sheets + 4D animated GIFs
 ├── verification_audit.json       # Machine-readable check results, timings, and flagged gaps
 ├── report.html                   # Browser-ready HTML report with clickable full-res figures
 └── report.md                     # Markdown version of the verification report

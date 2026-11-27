@@ -195,3 +195,35 @@ def test_site_naming_none_and_opt_in_views_packets(
             assert (out_dir / pkt["views"]["enhanced"]["fmri_carpet_summary"]).exists()
         if mod == "dwi":
             assert (out_dir / pkt["views"]["enhanced"]["dwi_shell_dropout_summary"]).exists()
+
+
+def test_bids_acq_and_glob_filters_skip_motion_acquisitions(tmp_path: Path) -> None:
+    """MR-ART style multi-acq BIDS directories must filter cleanly to acq-standard when requested."""
+    import nibabel as nib
+    import numpy as np
+
+    from ghibli.io.bids import discover_bids_scans
+    from ghibli.synthesis.cohort import discover_structural_seeds
+
+    anat = tmp_path / "sub-000103" / "anat"
+    anat.mkdir(parents=True)
+    img = nib.Nifti1Image(np.ones((8, 8, 8), dtype=np.float32), np.eye(4))
+    for acq in ("headmotion1", "headmotion2", "standard"):
+        nib.save(img, str(anat / f"sub-000103_acq-{acq}_T1w.nii.gz"))
+
+    # Without filter, headmotion1 sorts alphabetically first
+    unfiltered = discover_bids_scans(tmp_path, modalities=["T1w"])
+    assert len(unfiltered) == 3
+    assert unfiltered[0].entities["acq"] == "headmotion1"
+
+    # With acq="standard", only acq-standard is selected
+    filtered = discover_bids_scans(tmp_path, modalities=["T1w"], acq="standard")
+    assert len(filtered) == 1
+    assert filtered[0].entities["acq"] == "standard"
+
+    seeds = discover_structural_seeds(tmp_path, acq="standard")
+    assert len(seeds) == 1
+    assert seeds[0].t1_scan.entities["acq"] == "standard"
+
+    globbed = discover_bids_scans(tmp_path, modalities=["T1w"], filename_glob="*acq-headmotion*")
+    assert len(globbed) == 2

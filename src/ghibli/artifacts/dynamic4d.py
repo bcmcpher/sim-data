@@ -48,32 +48,60 @@ class Motion4D(BaseArtifactTransform):
         zooms = np.array(ctx.zooms, dtype=np.float64)
         center = np.array(ctx.spatial_shape, dtype=np.float64) / 2.0
 
-        drift_trans_std = float(self.params.get("drift_trans_mm", 0.08 + 0.55 * self.severity))
-        drift_rot_deg = float(self.params.get("drift_rot_deg", 0.08 + 0.55 * self.severity))
-        spike_prob = float(self.params.get("spike_prob", 0.04 + 0.20 * self.severity))
-        spike_trans_mm = float(self.params.get("spike_trans_mm", 0.4 + 2.8 * self.severity))
-        spike_rot_deg = float(self.params.get("spike_rot_deg", 0.4 + 2.5 * self.severity))
+        drift_trans_std = float(self.params.get("drift_trans_mm", 0.03 + 0.16 * self.severity))
+        drift_rot_deg = float(self.params.get("drift_rot_deg", 0.03 + 0.16 * self.severity))
+        spike_prob = float(self.params.get("spike_prob", 0.03 + 0.09 * self.severity))
+        spike_trans_mm = float(self.params.get("spike_trans_mm", 0.35 + 1.85 * self.severity))
+        spike_rot_deg = float(self.params.get("spike_rot_deg", 0.30 + 1.65 * self.severity))
         rotate_bvecs = bool(self.params.get("rotate_bvecs", ctx.rotate_dwi_bvecs))
 
-        # Pre-sample fixed-shape latent arrays once so CRN trajectories are strictly nested & monotone
-        u_drift_trans = ctx.rng.normal(0.0, 1.0, size=(n_t, 3))
-        u_drift_rot = ctx.rng.normal(0.0, 1.0, size=(n_t, 3))
+        # Pre-sample fixed-shape latent arrays once so CRN trajectories are strictly nested & monotone.
+        # Build a temporally smooth cumulative head-pose trajectory:
+        #   1. Correlated AR(1) velocity integrated into cumulative postural drift (head continues
+        #      smoothly from pose[t-1] rather than jumping randomly around the origin each TR).
+        #   2. Sparse discrete jerks/swallows that leave a 65% permanent posture shift (from which
+        #      subsequent TRs continue) plus a 35% 1-TR transient recoil.
+        u_vel_trans = ctx.rng.normal(0.0, 1.0, size=(n_t, 3))
+        u_vel_rot = ctx.rng.normal(0.0, 1.0, size=(n_t, 3))
         u_spike_trigger = ctx.rng.random(size=n_t)
         u_spike_trans = ctx.rng.normal(0.0, 1.0, size=(n_t, 3))
         u_spike_rot = ctx.rng.normal(0.0, 1.0, size=(n_t, 3))
         u_spin_sign = ctx.rng.choice([-1.0, 1.0], size=n_t)
 
+        vel_phi = 0.78
+        vel_innov_scale = float(np.sqrt(1.0 - vel_phi**2))
+        vel_trans = np.zeros((n_t, 3), dtype=np.float64)
+        vel_rot = np.zeros((n_t, 3), dtype=np.float64)
+
+        pose_state_trans = np.zeros((n_t, 3), dtype=np.float64)
+        pose_state_rot = np.zeros((n_t, 3), dtype=np.float64)
         trans_mm = np.zeros((n_t, 3), dtype=np.float64)
         rot_deg = np.zeros((n_t, 3), dtype=np.float64)
         spike_frames: list[int] = []
 
         for t in range(1, n_t):
-            trans_mm[t] = 0.85 * trans_mm[t - 1] + drift_trans_std * u_drift_trans[t]
-            rot_deg[t] = 0.85 * rot_deg[t - 1] + drift_rot_deg * u_drift_rot[t]
+            vel_trans[t] = vel_phi * vel_trans[t - 1] + vel_innov_scale * u_vel_trans[t]
+            vel_rot[t] = vel_phi * vel_rot[t - 1] + vel_innov_scale * u_vel_rot[t]
+
+            # Gentle coil-cushion restoring factor (0.98) keeps long runs inside FOV while
+            # strictly advancing continuously from the previous frame's resting posture.
+            pose_state_trans[t] = 0.98 * pose_state_trans[t - 1] + drift_trans_std * vel_trans[t]
+            pose_state_rot[t] = 0.98 * pose_state_rot[t - 1] + drift_rot_deg * vel_rot[t]
+
+            transient_trans = np.zeros(3, dtype=np.float64)
+            transient_rot = np.zeros(3, dtype=np.float64)
             if float(u_spike_trigger[t]) < spike_prob:
-                trans_mm[t] += spike_trans_mm * u_spike_trans[t]
-                rot_deg[t] += spike_rot_deg * u_spike_rot[t]
+                delta_t = spike_trans_mm * u_spike_trans[t]
+                delta_r = spike_rot_deg * u_spike_rot[t]
+                # 65% new resting posture + 35% brief 1-TR jerk/swallow recoil
+                pose_state_trans[t] += 0.65 * delta_t
+                pose_state_rot[t] += 0.65 * delta_r
+                transient_trans = 0.35 * delta_t
+                transient_rot = 0.35 * delta_r
                 spike_frames.append(t)
+
+            trans_mm[t] = pose_state_trans[t] + transient_trans
+            rot_deg[t] = pose_state_rot[t] + transient_rot
 
         rot_rad = np.deg2rad(rot_deg)
         fd = compute_power_fd(trans_mm, rot_rad, radius_mm=50.0)
@@ -87,13 +115,15 @@ class Motion4D(BaseArtifactTransform):
             inv_rot = rot_mat.T
             offset = center - inv_rot @ center - inv_rot @ trans_vox
 
+            # Apply cumulative pose directly to the clean volume at TR t (physically equivalent to
+            # sequential incremental moves without compounding 30+ passes of interpolation blur).
             vol = ndimage.affine_transform(
                 ctx.data[..., t], matrix=inv_rot, offset=offset, order=1, mode="nearest"
             )
 
-            # Spin-history intensity transient on high-FD volumes (BOLD)
-            if t > 0 and fd[t] > 0.25 and ctx.modality == "bold":
-                spin_amp = float(np.clip(0.04 * fd[t], 0.0, 0.22))
+            # Spin-history interleaved-slice transient only on genuine high-FD jerks (BOLD)
+            if t > 0 and fd[t] > 0.45 and ctx.modality == "bold":
+                spin_amp = float(np.clip(0.035 * (fd[t] - 0.45), 0.0, 0.18))
                 sign = float(u_spin_sign[t])
                 vol = vol.copy()
                 vol[:, :, ::2] *= 1.0 + sign * spin_amp
@@ -131,6 +161,15 @@ class Motion4D(BaseArtifactTransform):
             "fd_perc_gt_02": round(100.0 * fd_gt_02 / max(1, n_t), 2),
             "n_spike_frames": len(spike_frames),
             "rotate_bvecs": rotate_bvecs,
+            "motion_params": {
+                "trans_x_mm": [round(float(x), 3) for x in trans_mm[:, 0]],
+                "trans_y_mm": [round(float(x), 3) for x in trans_mm[:, 1]],
+                "trans_z_mm": [round(float(x), 3) for x in trans_mm[:, 2]],
+                "rot_x_deg": [round(float(x), 3) for x in rot_deg[:, 0]],
+                "rot_y_deg": [round(float(x), 3) for x in rot_deg[:, 1]],
+                "rot_z_deg": [round(float(x), 3) for x in rot_deg[:, 2]],
+                "fd_mm": [round(float(x), 3) for x in fd],
+            },
         }
 
 

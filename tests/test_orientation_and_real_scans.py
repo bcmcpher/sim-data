@@ -23,6 +23,7 @@ from ghibli.io.orientation import (
     estimate_background_noise_sigma,
     reorient_bvecs_to_ras,
     resolve_encoding_axes,
+    resolve_encoding_axes_with_source,
 )
 from ghibli.pipeline.engine import run_simulation_plan
 
@@ -147,3 +148,33 @@ def test_excess_variance_noise_calibration_subtracts_baseline_noise(
         np.sqrt(max(float(p_add["sigma_target_abs"]) ** 2 - sigma_0**2, 0.0))  # type: ignore[arg-type]
     )
     assert abs(float(p_excess["sigma_abs"]) - expected_eff) < 1e-2  # type: ignore[arg-type]
+
+
+def test_dicom_orientation_fallback_reports_dicom_inferred_source() -> None:
+    """Sagittal MPRAGE DICOM tags resolve PE=1 (A-P), RO=2 (S-I), SL=0 (R-L) with source=dicom_inferred."""
+    sidecar = {
+        "ImageOrientationPatientDICOM": [0.0, 1.0, 0.0, 0.0, 0.0, -1.0],
+        "InPlanePhaseEncodingDirectionDICOM": "ROW",
+    }
+    pe, ro, sl, src = resolve_encoding_axes_with_source(sidecar, modality="T1w")
+    assert (pe, ro, sl) == (1, 2, 0)
+    assert src == "dicom_inferred"
+
+
+def test_icv_anchored_priors_keep_bg_outside_head_and_bbox_on_icv() -> None:
+    """Supplying icv_mask anchors bbox/brain_mask to cranium while bg_mask excludes extracranial neck."""
+    vol = np.zeros((32, 32, 48), dtype=np.float32)
+    # Full head + inferior neck spanning Z=4..42
+    vol[8:24, 8:24, 4:42] = 400.0
+    # Intracranial brain only in superior half Z=20..40
+    icv = np.zeros_like(vol, dtype=bool)
+    icv[10:22, 10:22, 20:40] = True
+
+    priors = compute_anatomical_priors(vol, icv_mask=icv)
+    assert priors.bbox_min[2] == 20
+    assert priors.bbox_max[2] == 39
+    assert priors.head_mask is not None
+    # Neck voxels (Z=6..14) must be in head_mask and NOT misclassified as background air
+    assert bool(priors.head_mask[16, 16, 10])
+    assert not bool(priors.bg_mask[16, 16, 10])
+    assert bool(priors.bg_mask[0, 0, 0])

@@ -128,6 +128,16 @@ def synthesize_cohort_cmd(
         "--preserve-real",
         help="Keep real subjects' existing modalities untouched (zero warp) and synthesize only missing modalities.",
     ),
+    acq: Optional[str] = typer.Option(
+        None,
+        "--acq",
+        help="Optional BIDS acq-<label> filter (exact or glob, e.g. 'standard' for MR-ART).",
+    ),
+    glob: Optional[str] = typer.Option(
+        None,
+        "--glob",
+        help="Optional filename glob filter for seed BIDS scans (e.g. '*acq-standard*').",
+    ),
     brain_mask: Optional[Path] = typer.Option(
         None, "--brain-mask", exists=True, help="Optional external brain/ICV mask NIfTI (Option 2)."
     ),
@@ -153,6 +163,10 @@ def synthesize_cohort_cmd(
         cfg.allow_few_seeds = True
     if preserve_real:
         cfg.preserve_real_modalities = True
+    if acq is not None:
+        cfg.seed_acq = acq
+    if glob is not None:
+        cfg.seed_glob = glob
     if brain_mask is not None:
         cfg.templates.brain_mask_nifti = brain_mask
     if tissue_pve is not None:
@@ -186,11 +200,18 @@ def generate(
         "--manifest-out",
         help="Optional path for manifest.tsv (defaults to <out-dir>/manifest.tsv, ignored by .bidsignore).",
     ),
+    acq: Optional[str] = typer.Option(
+        None,
+        "--acq",
+        help="Optional BIDS acq-<label> filter (exact or glob, e.g. 'standard').",
+    ),
     workers: int = typer.Option(1, "--workers", min=1, help="Parallel worker processes."),
     device: str = typer.Option("auto", "--device", help="PyTorch compute device: auto, cpu, or cuda."),
 ) -> None:
     """Generate a simulated BIDS dataset and official ground-truth manifest.tsv."""
     cfg = SimulationConfig.from_yaml(config)
+    if acq is not None:
+        cfg.acq = acq
     if cfg.output.naming_scheme == "unblinded_validation":
         console.print(
             "[yellow]WARNING: output.naming_scheme='unblinded_validation' embeds artifact/dose labels "

@@ -47,10 +47,11 @@ def _render_sites_comparison(
     site_volumes: dict[str, np.ndarray],
     site_meta: dict[str, dict[str, Any]],
     out_path: Path,
+    icv_mask: np.ndarray | None = None,
 ) -> Path:
     """Render 4-row cross-site visual + intensity histogram comparison for the same subject."""
     native_vol = site_volumes[site_order[0]]
-    priors = compute_anatomical_priors(native_vol)
+    priors = compute_anatomical_priors(native_vol, icv_mask=icv_mask)
     mid_z = (priors.bbox_min[2] + priors.bbox_max[2]) // 2
     nat_vmin, nat_vmax = common.compute_window(native_vol)
     nat_p95 = float(np.percentile(native_vol[priors.brain_mask], 95.0))
@@ -208,12 +209,17 @@ def run_step(
         native_priors = None
         pedestal_sites: list[str] = []
 
+        icv_mask_arr: np.ndarray | None = None
+        if seed_diag.get("external_brain_mask") and Path(str(seed_diag["external_brain_mask"])).exists():
+            m_arr, _, _ = common.load_ras_volume(Path(str(seed_diag["external_brain_mask"])))
+            icv_mask_arr = m_arr > 0.5
+
         for sid in site_order:
             row = merged_clean[merged_clean["site_id"] == sid].iloc[0]
             vol, _, _ = common.load_ras_volume(clean_out / str(row["nifti_path"]))
             site_volumes[sid] = vol
             if native_priors is None:
-                native_priors = compute_anatomical_priors(vol)
+                native_priors = compute_anatomical_priors(vol, icv_mask=icv_mask_arr)
             bg_vals = vol[native_priors.bg_mask]
             bg_med = float(np.median(bg_vals))
             bg_std = float(np.std(bg_vals))
@@ -230,13 +236,16 @@ def run_step(
                 "ref_ssim": round(float(row["ref_ssim"]), 4),
             }
             if sid != "NativeSite" and bg_med > max(5.0 * site_meta["NativeSite"]["bg_median"], 10.0):
-                pedestal_sites.append(f"{sid} (bg_med={bg_med:.1f}, offset={float(row['site_offset']):+.3f})")
+                pedestal_sites.append(
+                    f"{sid} (bg_med={bg_med:.1f}, noise_rel={float(row['site_noise_sigma_rel']):.3f})"
+                )
 
         fig_sites = _render_sites_comparison(
             site_order=site_order,
             site_volumes=site_volumes,
             site_meta=site_meta,
             out_path=out_root / "figures" / "04a_sites_comparison.png",
+            icv_mask=icv_mask_arr,
         )
         figures["sites_comparison"] = str(fig_sites.relative_to(out_root))
 
@@ -267,9 +276,9 @@ def run_step(
                 status="warn" if pedestal_sites else "pass",
                 metric=f"Native bg_med={site_meta['NativeSite']['bg_median']:.1f}; elevated={len(pedestal_sites)} site(s)",
                 detail=(
-                    f"Positive site intensity_offset adds a uniform pedestal to background air voxels: {', '.join(pedestal_sites)}. Consider masking offset to foreground or applying after background air check."
+                    f"Simulated site coil noise floor lifted background air median above 10.0: {', '.join(pedestal_sites)}."
                     if pedestal_sites
-                    else "Background air median remained physically low across all simulated sites."
+                    else "Background air median remained physically low across all simulated sites (foreground-masked offset + excess-variance coil noise)."
                 ),
             )
         )

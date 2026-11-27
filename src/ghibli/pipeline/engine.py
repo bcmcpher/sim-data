@@ -7,6 +7,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import nibabel as nib
+import nibabel.processing as nib_proc
 import numpy as np
 from joblib import Parallel, delayed
 
@@ -17,11 +19,13 @@ from ghibli.io.bids import (
     BIDSScan,
     build_output_bids_stem,
     discover_bids_scans,
+    discover_subject_brain_mask,
     load_bids_scan,
     write_bids_root_files,
     write_bids_scan,
 )
 from ghibli.io.orientation import (
+    canonicalize_to_ras,
     canonicalize_to_ras_with_transform,
     compute_anatomical_priors,
     estimate_background_noise_sigma,
@@ -51,11 +55,43 @@ class SimulationResult:
     rows: list[dict[str, Any]]
 
 
+def _load_aligned_icv_mask(
+    mask_path: Path | None,
+    target_shape: tuple[int, int, int],
+    target_affine: np.ndarray,
+) -> np.ndarray | None:
+    """Load and RAS-align an optional external/cached intracranial brain mask."""
+    if mask_path is None or not mask_path.exists():
+        return None
+    try:
+        m_img = nib.load(str(mask_path))
+        if not isinstance(m_img, nib.Nifti1Image):
+            if isinstance(m_img, nib.spatialimages.SpatialImage):
+                m_img = nib.Nifti1Image(np.asarray(m_img.get_fdata(), dtype=np.float32), m_img.affine)
+            else:
+                return None
+        m_data, m_aff, _ = canonicalize_to_ras(m_img)
+        if m_data.ndim == 4:
+            m_data = m_data[..., 0]
+        if m_data.shape != target_shape or not np.allclose(m_aff, target_affine, atol=1e-2):
+            res = nib_proc.resample_from_to(
+                nib.Nifti1Image(m_data.astype(np.float32), m_aff),
+                (target_shape, target_affine),
+                order=0,
+            )
+            m_data = np.asarray(res.get_fdata(dtype=np.float32), dtype=np.float32)
+        mask = np.asarray(m_data > 0.5, dtype=bool)
+        return mask if int(mask.sum()) >= 64 else None
+    except Exception:
+        return None
+
+
 def simulate_single_recipe(
     recipe: ScanRecipe,
     config: SimulationConfig,
     out_dir: str | Path,
     device: str = "auto",
+    brain_mask_path: Path | None = None,
 ) -> dict[str, Any]:
     """Execute the strict 7-stage physical causal pipeline for one ScanRecipe."""
     out_root = Path(out_dir)
@@ -67,7 +103,11 @@ def simulate_single_recipe(
     bvecs_ras = (
         reorient_bvecs_to_ras(loaded.bvecs, ornt_transform) if loaded.bvecs is not None else None
     )
-    clean_priors = compute_anatomical_priors(clean_data, bvals=loaded.bvals)
+    icv_mask: np.ndarray | None = None
+    if brain_mask_path is not None and recipe.scan.modality in ("T1w", "T2w", "FLAIR"):
+        spatial_shape = (int(clean_data.shape[0]), int(clean_data.shape[1]), int(clean_data.shape[2]))
+        icv_mask = _load_aligned_icv_mask(brain_mask_path, spatial_shape, affine)
+    clean_priors = compute_anatomical_priors(clean_data, bvals=loaded.bvals, icv_mask=icv_mask)
     baseline_sigma = estimate_background_noise_sigma(
         clean_data, clean_priors.bg_mask, modality=recipe.scan.modality, bvals=loaded.bvals
     )
@@ -278,10 +318,20 @@ def run_simulation_plan(
     scans = (
         scans_override
         if scans_override is not None
-        else discover_bids_scans(bids_dir, modalities=config.modalities)
+        else discover_bids_scans(bids_dir, modalities=config.modalities, acq=config.acq)
     )
     if not scans:
         raise ValueError(f"No matching BIDS scans found under {bids_dir} for {config.modalities}")
+
+    # Auto-discover optional per-subject brain/ICV masks once so structural priors & landmarks
+    # anchor to the cranium instead of full head+neck without re-running extraction per recipe.
+    mask_by_sub_ses: dict[tuple[str, str | None], Path | None] = {}
+    for s in scans:
+        key = (s.subject, s.session)
+        if key not in mask_by_sub_ses:
+            mask_by_sub_ses[key] = discover_subject_brain_mask(
+                bids_dir, subject=s.subject, session=s.session
+            )
 
     recipes = build_recipes(scans, config)
     out_root = Path(out_dir)
@@ -291,12 +341,25 @@ def run_simulation_plan(
 
     if workers <= 1 or len(recipes) <= 1:
         rows = [
-            simulate_single_recipe(r, config=config, out_dir=out_root, device=device)
+            simulate_single_recipe(
+                r,
+                config=config,
+                out_dir=out_root,
+                device=device,
+                brain_mask_path=mask_by_sub_ses.get((r.scan.subject, r.scan.session)),
+            )
             for r in recipes
         ]
     else:
         rows = Parallel(n_jobs=workers, prefer="processes")(
-            delayed(simulate_single_recipe)(r, config, out_root, device) for r in recipes
+            delayed(simulate_single_recipe)(
+                r,
+                config,
+                out_root,
+                device,
+                mask_by_sub_ses.get((r.scan.subject, r.scan.session)),
+            )
+            for r in recipes
         )
 
     # Link every trajectory step to its shared s=0 baseline scan_id

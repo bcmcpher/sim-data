@@ -72,9 +72,11 @@ class CohortSynthesisResult:
 def discover_structural_seeds(
     seed_bids_dir: str | Path,
     brain_mask_suffix: str = "desc-brain_mask",
+    acq: str | None = None,
+    filename_glob: str | None = None,
 ) -> list[SeedSubject]:
     """Discover clean real seed subjects (requiring T1w + optional T2w/FLAIR/bold/dwi/brain mask)."""
-    all_scans = discover_bids_scans(seed_bids_dir)
+    all_scans = discover_bids_scans(seed_bids_dir, acq=acq, filename_glob=filename_glob)
     by_sub_mod: dict[tuple[str, Modality], BIDSScan] = {}
     t1_scans: list[BIDSScan] = []
     for s in all_scans:
@@ -482,7 +484,10 @@ def synthesize_cohort(
 ) -> CohortSynthesisResult:
     """Expand structural seeds into N multimodal subjects OR complete missing modalities on real subjects."""
     seeds = discover_structural_seeds(
-        seed_bids_dir, brain_mask_suffix=config.contrast.brain_mask_suffix
+        seed_bids_dir,
+        brain_mask_suffix=config.contrast.brain_mask_suffix,
+        acq=config.seed_acq,
+        filename_glob=config.seed_glob,
     )
     if not seeds:
         raise ValueError(f"No T1w seed scans found under {seed_bids_dir}")

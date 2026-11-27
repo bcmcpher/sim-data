@@ -161,6 +161,7 @@ class SimulationConfig(BaseModel):
 
     global_seed: int = 42
     modalities: list[Modality] = Field(default_factory=_default_modalities)
+    acq: str | None = None
     sampling: SamplingPlanConfig = Field(default_factory=SamplingPlanConfig)
     sites: list[SiteProfileConfig] = Field(default_factory=list)
     output: OutputConfig = Field(default_factory=OutputConfig)
@@ -259,6 +260,8 @@ class CohortSynthesisConfig(BaseModel):
     min_seed_subjects: int = Field(default=3, ge=1)
     allow_few_seeds: bool = False
     preserve_real_modalities: bool = False
+    seed_acq: str | None = None
+    seed_glob: str | None = None
     modalities: list[Modality] = Field(default_factory=_default_modalities)
     warp: DiffeomorphicWarpConfig = Field(default_factory=DiffeomorphicWarpConfig)
     templates: OptionalTemplateConfig = Field(default_factory=OptionalTemplateConfig)

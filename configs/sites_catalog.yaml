@@ -8,7 +8,7 @@ sites:
     bias_order: 2
     bias_coeffs: [0.10, -0.06, 0.08]
     coil_count: 32
-    noise_sigma_rel: 0.012
+    noise_sigma_rel: 0.006
     g_factor_strength: 0.12
     voxel_scale: [1.0, 1.0, 1.0]
     jitter_scale: 0.08
@@ -22,7 +22,7 @@ sites:
     bias_order: 3
     bias_coeffs: [-0.16, 0.14, -0.10]
     coil_count: 8
-    noise_sigma_rel: 0.032
+    noise_sigma_rel: 0.015
     g_factor_strength: 0.22
     voxel_scale: [0.99, 0.99, 1.01]
     jitter_scale: 0.10
@@ -36,7 +36,7 @@ sites:
     bias_order: 2
     bias_coeffs: [0.14, 0.12, -0.12]
     coil_count: 16
-    noise_sigma_rel: 0.020
+    noise_sigma_rel: 0.009
     g_factor_strength: 0.28
     voxel_scale: [1.01, 1.00, 0.99]
     jitter_scale: 0.08
@@ -50,7 +50,7 @@ sites:
     bias_order: 3
     bias_coeffs: [-0.12, -0.14, 0.18]
     coil_count: 64
-    noise_sigma_rel: 0.026
+    noise_sigma_rel: 0.011
     g_factor_strength: 0.45
     voxel_scale: [1.00, 1.01, 1.00]
     jitter_scale: 0.09

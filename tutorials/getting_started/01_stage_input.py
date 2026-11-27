@@ -29,8 +29,9 @@ from ghibli.io.orientation import (  # noqa: E402
     canonicalize_to_ras_with_transform,
     compute_anatomical_priors,
     estimate_background_noise_sigma,
-    resolve_encoding_axes,
+    resolve_encoding_axes_with_source,
 )
+from ghibli.synthesis.brain_mask import extract_brain_mask  # noqa: E402
 
 
 def _render_input_priors_figure(
@@ -138,14 +139,31 @@ def run_step(
         orig_shape = [int(s) for s in raw_img.shape]
         orig_dtype = str(raw_img.get_data_dtype())
 
-        ras_data, _affine, zooms, ornt_transform = canonicalize_to_ras_with_transform(raw_img)
+        ras_data, ras_affine, zooms, ornt_transform = canonicalize_to_ras_with_transform(raw_img)
         if ras_data.ndim != 3:
             raise ValueError(f"Expected 3D structural T1w NIfTI, got shape {ras_data.shape}")
 
-        pe_axis, ro_axis, sl_axis = resolve_encoding_axes(
+        pe_axis, ro_axis, sl_axis, axis_source = resolve_encoding_axes_with_source(
             sidecar, modality="T1w", ornt_transform=ornt_transform
         )
-        priors = compute_anatomical_priors(ras_data)
+
+        # Extract intracranial brain mask once (external -> EVAC+ -> offline morphological) and
+        # persist it into 00_seed_bids so all downstream simulation & synthesis steps reuse it.
+        bm_res = extract_brain_mask(
+            t1_corr=ras_data,
+            affine=ras_affine,
+            method="auto",
+            brain_mask_path=dst_mask,
+            device="auto",
+        )
+        if dst_mask is None:
+            dst_mask = anat_dir / f"sub-{sub_clean}_desc-brain_mask.nii.gz"
+            nib.save(
+                nib.Nifti1Image(bm_res.icv_mask.astype(np.uint8), ras_affine),
+                str(dst_mask),
+            )
+
+        priors = compute_anatomical_priors(ras_data, icv_mask=bm_res.icv_mask)
         sigma_0 = estimate_background_noise_sigma(ras_data, priors.bg_mask, modality="T1w")
 
         bbox_span = [
@@ -158,6 +176,8 @@ def run_step(
 
         has_pe = "PhaseEncodingDirection" in sidecar
         has_sl = "SliceEncodingDirection" in sidecar
+        axis_names = {0: "R-L", 1: "A-P", 2: "S-I"}
+        axes_resolved_ok = axis_source in ("bids_explicit", "dicom_inferred")
         checks.append(
             common.CheckResult(
                 step="01_stage_input",
@@ -171,12 +191,16 @@ def run_step(
             common.CheckResult(
                 step="01_stage_input",
                 name="sidecar_encoding_axes",
-                status="pass" if (has_pe and has_sl) else "warn",
-                metric=f"PE={pe_axis}, RO={ro_axis}, SL={sl_axis} (explicit PE={has_pe}, SL={has_sl})",
+                status="pass" if axes_resolved_ok else "warn",
+                metric=f"PE={pe_axis} ({axis_names[pe_axis]}), RO={ro_axis} ({axis_names[ro_axis]}), SL={sl_axis} ({axis_names[sl_axis]}) [source={axis_source}]",
                 detail=(
                     "Explicit PhaseEncodingDirection and SliceEncodingDirection found in JSON."
-                    if (has_pe and has_sl)
-                    else "Sidecar lacks PhaseEncodingDirection/SliceEncodingDirection (common in DICOM-converted 3D T1w such as MR-ART); ghibli defaulted to PE=1 (A-P), SL=2 (S-I)."
+                    if axis_source == "bids_explicit"
+                    else (
+                        "Resolved exact acquisition axes from DICOM orientation tags (ImageOrientationPatientDICOM + InPlanePhaseEncodingDirectionDICOM)."
+                        if axis_source == "dicom_inferred"
+                        else f"Sidecar lacks complete BIDS/DICOM encoding tags (source={axis_source}); fell back to PE={pe_axis}, SL={sl_axis}."
+                    )
                 ),
             )
         )
@@ -185,11 +209,11 @@ def run_step(
                 step="01_stage_input",
                 name="priors_bbox_extent",
                 status="warn" if bbox_frac[2] > 0.82 else "pass",
-                metric=f"fg_frac={fg_frac}, bbox_frac={bbox_frac} (Z={priors.bbox_min[2]}..{priors.bbox_max[2]})",
+                metric=f"method={bm_res.method}, icv_frac={fg_frac}, bbox_frac={bbox_frac} (Z={priors.bbox_min[2]}..{priors.bbox_max[2]})",
                 detail=(
-                    "Foreground mask spans >82% of Z-axis (typical full-head/neck scan). Because priors.brain_mask covers the whole head+neck, bbox-anchored artifacts (fov_cropping, defacing_damage, susceptibility_metal) and mask-free T1w->T2w conversion may be affected by neck/face extent."
+                    "Brain mask still spans >82% of Z-axis; supply --brain-mask to separate cranium from neck."
                     if bbox_frac[2] > 0.82
-                    else "Foreground bounding box is compact within FOV."
+                    else f"ICV-anchored priors ({bm_res.method}) cleanly isolate the cranium (Z={priors.bbox_min[2]}..{priors.bbox_max[2]}) while keeping bg_mask strictly outside the full head+neck envelope."
                 ),
             )
         )
@@ -207,7 +231,7 @@ def run_step(
             ras_data,
             priors=priors,
             out_path=out_root / "figures" / "01_input_priors.png",
-            title=f"Step 01: Staged Input T1w ({src_t1w.name}) & Anatomical Priors",
+            title=f"Step 01: Staged Input T1w ({src_t1w.name}) & ICV-Anchored Priors ({bm_res.method})",
         )
 
     summary: dict[str, Any] = {
@@ -217,6 +241,7 @@ def run_step(
         "source_t1w": str(src_t1w),
         "source_json": str(src_json) if src_json else None,
         "external_brain_mask": str(dst_mask) if dst_mask else None,
+        "brain_mask_method": bm_res.method,
         "seed_bids_dir": str(seed_bids),
         "staged_t1w": str(dst_t1w),
         "subject": sub_clean,
@@ -225,6 +250,7 @@ def run_step(
         "ras_shape": [int(s) for s in ras_data.shape],
         "zooms_mm": [round(float(z), 4) for z in zooms],
         "encoding_axes_ras": {"pe": pe_axis, "ro": ro_axis, "sl": sl_axis},
+        "encoding_axes_source": axis_source,
         "sidecar_has_pe_dir": has_pe,
         "sidecar_has_sl_dir": has_sl,
         "priors": {

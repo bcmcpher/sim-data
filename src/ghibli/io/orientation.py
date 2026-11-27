@@ -17,8 +17,8 @@ from skimage.filters import threshold_otsu
 class AnatomicalPriors:
     """Clean anatomical masks and tissue intensity estimates computed pre-corruption."""
 
-    brain_mask: np.ndarray  # 3D bool mask of head/brain foreground
-    bg_mask: np.ndarray  # 3D bool mask of background air outside dilated foreground
+    brain_mask: np.ndarray  # 3D bool mask of intracranial brain (or head foreground if no ICV mask)
+    bg_mask: np.ndarray  # 3D bool mask of background air outside dilated head foreground
     wm_mask: np.ndarray  # 3D bool pseudo-white-matter mask (higher tissue cluster)
     gm_mask: np.ndarray  # 3D bool pseudo-gray-matter mask (lower tissue cluster)
     bbox_min: tuple[int, int, int]  # (x_min, y_min, z_min) in RAS+ voxels
@@ -26,6 +26,7 @@ class AnatomicalPriors:
     fg_median: float
     fg_p95: float
     bg_std: float
+    head_mask: np.ndarray | None = None  # 3D bool mask of full head/neck foreground when ICV mask is supplied
 
 
 def canonicalize_to_ras_with_transform(
@@ -70,17 +71,18 @@ def reorient_bvecs_to_ras(
     return np.ascontiguousarray(out, dtype=np.float32)
 
 
-def resolve_encoding_axes(
+def resolve_encoding_axes_with_source(
     sidecar: dict[str, Any] | None,
     modality: str,
     ornt_transform: np.ndarray | None = None,
-) -> tuple[int, int, int]:
-    """Resolve (phase_encode_axis, readout_axis, slice_axis) in RAS+ coordinates.
+) -> tuple[int, int, int, str]:
+    """Resolve (phase_encode_axis, readout_axis, slice_axis, source) in RAS+ coordinates.
 
-    When `ornt_transform` (from `canonicalize_to_ras_with_transform`) is supplied,
-    sidecar `PhaseEncodingDirection` and `SliceEncodingDirection` (which refer to
-    original voxel axes before RAS+ canonicalization) are remapped into RAS+ axes.
-    Returns integer indices in {0 (R-L), 1 (A-P), 2 (S-I)}.
+    `source` is one of:
+    - `"bids_explicit"`: Both `PhaseEncodingDirection` and `SliceEncodingDirection` in JSON.
+    - `"dicom_inferred"`: Resolved via `ImageOrientationPatientDICOM` + `InPlanePhaseEncodingDirectionDICOM`.
+    - `"bids_partial"`: One explicit BIDS axis plus DICOM/default fallback for the other.
+    - `"default"`: Neither BIDS nor DICOM orientation tags present; fell back to canonical defaults.
     """
     sidecar = sidecar or {}
     axis_map = {"i": 0, "i-": 0, "j": 1, "j-": 1, "k": 2, "k-": 2}
@@ -113,25 +115,53 @@ def resolve_encoding_axes(
             inferred_pe = None
             inferred_sl = None
 
-    if pe_raw in axis_map:
+    pe_from_bids = pe_raw in axis_map
+    sl_from_bids = sl_raw in axis_map
+    pe_from_dicom = False
+    sl_from_dicom = False
+
+    if pe_from_bids:
         pe_axis = _map_axis(axis_map[pe_raw])
     elif inferred_pe is not None:
         pe_axis = inferred_pe
+        pe_from_dicom = True
     elif modality in ("bold", "dwi"):
         pe_axis = 1  # Anterior-Posterior standard for EPI
     else:
         pe_axis = 1  # AP default for structural
 
-    if sl_raw in axis_map:
+    if sl_from_bids:
         mapped_sl = _map_axis(axis_map[sl_raw])
         slice_axis = mapped_sl if mapped_sl != pe_axis else (2 if pe_axis != 2 else 0)
     elif inferred_sl is not None and inferred_sl != pe_axis:
         slice_axis = inferred_sl
+        sl_from_dicom = True
     else:
         slice_axis = 2 if pe_axis != 2 else 0
 
+    if pe_from_bids and sl_from_bids:
+        source = "bids_explicit"
+    elif pe_from_dicom and sl_from_dicom:
+        source = "dicom_inferred"
+    elif pe_from_bids or sl_from_bids or pe_from_dicom or sl_from_dicom:
+        source = "bids_partial"
+    else:
+        source = "default"
+
     readout_candidates = [ax for ax in (0, 1, 2) if ax not in (pe_axis, slice_axis)]
     readout_axis = readout_candidates[0]
+    return pe_axis, readout_axis, slice_axis, source
+
+
+def resolve_encoding_axes(
+    sidecar: dict[str, Any] | None,
+    modality: str,
+    ornt_transform: np.ndarray | None = None,
+) -> tuple[int, int, int]:
+    """Resolve (phase_encode_axis, readout_axis, slice_axis) in RAS+ coordinates."""
+    pe_axis, readout_axis, slice_axis, _ = resolve_encoding_axes_with_source(
+        sidecar=sidecar, modality=modality, ornt_transform=ornt_transform
+    )
     return pe_axis, readout_axis, slice_axis
 
 
@@ -203,8 +233,15 @@ def _largest_component(mask: np.ndarray) -> np.ndarray:
 def compute_anatomical_priors(
     data: np.ndarray,
     bvals: np.ndarray | None = None,
+    icv_mask: np.ndarray | None = None,
 ) -> AnatomicalPriors:
-    """Compute lightweight foreground/background/tissue priors from a 3D or 4D MRI volume."""
+    """Compute lightweight foreground/background/tissue priors from a 3D or 4D MRI volume.
+
+    When an intracranial `icv_mask` (e.g., from EVAC+ or external BIDS `*_desc-brain_mask`) is
+    supplied, `brain_mask`, `bbox_min`/`bbox_max`, and tissue clusters (`wm_mask`, `gm_mask`) are
+    anchored strictly to the intracranial brain, while `bg_mask` remains strictly outside the full
+    head/neck envelope (`head_mask`) so scalp and neck voxels are never mistaken for background air.
+    """
     if data.ndim == 4:
         if bvals is not None and len(bvals) == data.shape[3]:
             b0_idx = np.where(bvals <= 50.0)[0]
@@ -230,6 +267,7 @@ def compute_anatomical_priors(
             fg_median=1.0,
             fg_p95=1.0,
             bg_std=0.01,
+            head_mask=brain_mask.copy(),
         )
 
     p99 = float(np.percentile(pos, 99.5))
@@ -247,15 +285,25 @@ def compute_anatomical_priors(
 
     raw_fg = ndimage.binary_closing(raw_fg, iterations=2)
     raw_fg = ndimage.binary_fill_holes(raw_fg)
-    brain_mask = _largest_component(raw_fg)
-    if int(brain_mask.sum()) < 64:
-        brain_mask = ref > float(np.percentile(pos, 30.0))
+    head_mask = _largest_component(raw_fg)
+    if int(head_mask.sum()) < 64:
+        head_mask = ref > float(np.percentile(pos, 30.0))
 
-    # Background air mask: outside a dilated head envelope
-    dilated = ndimage.binary_dilation(brain_mask, iterations=4)
+    if (
+        icv_mask is not None
+        and icv_mask.shape == ref.shape
+        and int(np.asarray(icv_mask, dtype=bool).sum()) >= 64
+    ):
+        brain_mask = np.asarray(icv_mask, dtype=bool)
+        head_mask = head_mask | brain_mask
+    else:
+        brain_mask = head_mask
+
+    # Background air mask: outside a dilated full-head envelope (never includes scalp/neck)
+    dilated = ndimage.binary_dilation(head_mask, iterations=4)
     bg_mask = ~dilated
     if int(bg_mask.sum()) < 32:
-        bg_mask = ~brain_mask
+        bg_mask = ~head_mask
 
     # Pseudo-tissue split inside brain mask (higher cluster vs. lower cluster)
     fg_vals = ref[brain_mask]
@@ -299,4 +347,5 @@ def compute_anatomical_priors(
         fg_median=max(fg_median, 1e-6),
         fg_p95=max(fg_p95, 1e-6),
         bg_std=bg_std,
+        head_mask=head_mask,
     )
