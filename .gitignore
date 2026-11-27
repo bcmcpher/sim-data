@@ -16,6 +16,7 @@ htmlcov/
 demo_bids/
 demo_out/
 tutorial_output/
+benchmark_output/
 *.nii
 *.nii.gz
 !tests/**/*.nii
